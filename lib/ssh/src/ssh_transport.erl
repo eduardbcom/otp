@@ -51,7 +51,9 @@
 	 extract_public_key/1,
 	 ssh_packet/2, pack/2,
          valid_key_sha_alg/2,
-	 sha/1, sign/3, verify/5]).
+	 sha/1, sign/3, verify/5,
+         get_host_key/2,
+         call_KeyCb/3]).
 
 -export([dbg_trace/3]).
 
@@ -147,6 +149,8 @@ supported_algorithms(public_key) ->
        {'ecdsa-sha2-nistp384',  [{public_keys,ecdsa}, {hashs,sha384}, {curves,secp384r1}]},
        {'ecdsa-sha2-nistp521',  [{public_keys,ecdsa}, {hashs,sha512}, {curves,secp521r1}]},
        {'ecdsa-sha2-nistp256',  [{public_keys,ecdsa}, {hashs,sha256}, {curves,secp256r1}]},
+       {'ssh-ed25519',          [{public_keys,eddsa}, {curves,ed25519}                    ]},
+       {'ssh-ed448',            [{public_keys,eddsa}, {curves,ed448}                      ]},
        {'ssh-rsa',              [{public_keys,rsa},   {hashs,sha}                         ]},
        {'rsa-sha2-256',         [{public_keys,rsa},   {hashs,sha256}                      ]},
        {'rsa-sha2-512',         [{public_keys,rsa},   {hashs,sha512}                      ]},
@@ -431,7 +435,8 @@ key_exchange_first_msg(Kex, Ssh0) when Kex == 'ecdh-sha2-nistp256' ;
 %%% 
 handle_kexdh_init(#ssh_msg_kexdh_init{e = E}, 
 		  Ssh0 = #ssh{algorithms = #alg{kex=Kex,
-                                                hkey=SignAlg} = Algs}) ->
+                                                hkey=SignAlg} = Algs,
+                              opts = Opts}) ->
     %% server
     {G, P} = dh_group(Kex),
     if
@@ -439,7 +444,7 @@ handle_kexdh_init(#ssh_msg_kexdh_init{e = E},
             Sz = dh_bits(Algs),
 	    {Public, Private} = generate_key(dh, [P,G,2*Sz]),
 	    K = compute_key(dh, E, Private, [P,G]),
-	    MyPrivHostKey = get_host_key(Ssh0, SignAlg),
+	    MyPrivHostKey = get_host_key(SignAlg, Opts),
 	    MyPubHostKey = extract_public_key(MyPrivHostKey),
             H = kex_hash(Ssh0, MyPubHostKey, sha(Kex), {E,Public,K}),
             H_SIG = sign(H, sha(SignAlg), MyPrivHostKey),
@@ -578,14 +583,15 @@ handle_kex_dh_gex_init(#ssh_msg_kex_dh_gex_init{e = E},
 		       #ssh{keyex_key = {{Private, Public}, {G, P}},
 			    keyex_info = {Min, Max, NBits},
                             algorithms = #alg{kex=Kex,
-                                              hkey=SignAlg}} = Ssh0) ->
+                                              hkey=SignAlg},
+                            opts = Opts} = Ssh0) ->
     %% server
     if
 	1=<E, E=<(P-1) ->
 	    K = compute_key(dh, E, Private, [P,G]),
 	    if
 		1<K, K<(P-1) ->
-		    MyPrivHostKey = get_host_key(Ssh0, SignAlg),
+		    MyPrivHostKey = get_host_key(SignAlg, Opts),
 		    MyPubHostKey = extract_public_key(MyPrivHostKey),
                     H = kex_hash(Ssh0, MyPubHostKey, sha(Kex), {Min,NBits,Max,P,G,E,Public,K}),
                     H_SIG = sign(H, sha(SignAlg), MyPrivHostKey),
@@ -653,7 +659,8 @@ handle_kex_dh_gex_reply(#ssh_msg_kex_dh_gex_reply{public_host_key = PeerPubHostK
 %%% 
 handle_kex_ecdh_init(#ssh_msg_kex_ecdh_init{q_c = PeerPublic},
 		     Ssh0 = #ssh{algorithms = #alg{kex=Kex,
-                                                   hkey=SignAlg}}) ->
+                                                   hkey=SignAlg},
+                                 opts = Opts}) ->
     %% at server
     Curve = ecdh_curve(Kex),
     {MyPublic, MyPrivate} = generate_key(ecdh, Curve),
@@ -661,7 +668,7 @@ handle_kex_ecdh_init(#ssh_msg_kex_ecdh_init{q_c = PeerPublic},
 	compute_key(ecdh, PeerPublic, MyPrivate, Curve)
     of
 	K ->
-	    MyPrivHostKey = get_host_key(Ssh0, SignAlg),
+	    MyPrivHostKey = get_host_key(SignAlg, Opts),
 	    MyPubHostKey = extract_public_key(MyPrivHostKey),
             H = kex_hash(Ssh0, MyPubHostKey, sha(Curve), {PeerPublic, MyPublic, K}),
             H_SIG = sign(H, sha(SignAlg), MyPrivHostKey),
@@ -759,8 +766,7 @@ ext_info_message(#ssh{role=server,
                       send_ext_info=true,
                       opts = Opts} = Ssh0) ->
     AlgsList = lists:map(fun erlang:atom_to_list/1,
-                         proplists:get_value(public_key,
-                                             ?GET_OPT(preferred_algorithms, Opts))),
+                         ?GET_OPT(pref_public_key_algs, Opts)),
     Msg = #ssh_msg_ext_info{nr_extensions = 1,
                             data = [{"server-sig-algs", string:join(AlgsList,",")}]
                            },
@@ -778,10 +784,8 @@ sid(#ssh{session_id = Id},        _) -> Id.
 %%
 %% The host key should be read from storage
 %%
-get_host_key(SSH, SignAlg) ->
-    #ssh{key_cb = {KeyCb,KeyCbOpts}, opts = Opts} = SSH,
-    UserOpts = ?GET_OPT(user_options, Opts),
-    case KeyCb:host_key(SignAlg, [{key_cb_private,KeyCbOpts}|UserOpts]) of
+get_host_key(SignAlg, Opts) ->
+    case call_KeyCb(host_key, [SignAlg], Opts) of
 	{ok, PrivHostKey} ->
             %% Check the key - the KeyCb may be a buggy plugin
             case valid_key_sha_alg(PrivHostKey, SignAlg) of
@@ -792,6 +796,11 @@ get_host_key(SSH, SignAlg) ->
             exit({error, {Result, unsupported_key_type}})
     end.
 
+call_KeyCb(F, Args, Opts) ->
+    {KeyCb,KeyCbOpts} = ?GET_OPT(key_cb, Opts),
+    UserOpts = ?GET_OPT(user_options, Opts),
+    apply(KeyCb, F, Args ++ [[{key_cb_private,KeyCbOpts}|UserOpts]]).
+
 extract_public_key(#'RSAPrivateKey'{modulus = N, publicExponent = E}) ->
     #'RSAPublicKey'{modulus = N, publicExponent = E};
 extract_public_key(#'DSAPrivateKey'{y = Y, p = P, q = Q, g = G}) ->
@@ -799,6 +808,8 @@ extract_public_key(#'DSAPrivateKey'{y = Y, p = P, q = Q, g = G}) ->
 extract_public_key(#'ECPrivateKey'{parameters = {namedCurve,OID},
 				   publicKey = Q}) ->
     {#'ECPoint'{point=Q}, {namedCurve,OID}};
+extract_public_key({ed_pri, Alg, Pub, _Priv}) ->
+    {ed_pub, Alg, Pub};
 extract_public_key(#{engine:=_, key_id:=_, algorithm:=Alg} = M) ->
     case {Alg, crypto:privkey_to_pubkey(Alg, M)} of
         {rsa, [E,N]} ->
@@ -858,29 +869,30 @@ accepted_host(Ssh, PeerName, Public, Opts) ->
     end.
 
 
-yes_no(Ssh, Prompt)  ->
-    (Ssh#ssh.io_cb):yes_no(Prompt, Ssh#ssh.opts).
+yes_no(#ssh{opts=Opts}, Prompt)  ->
+    IoCb = ?GET_INTERNAL_OPT(io_cb, Opts, ssh_io),
+    IoCb:yes_no(Prompt, Opts).
 
 
 fmt_hostkey('ssh-rsa') -> "RSA";
 fmt_hostkey('ssh-dss') -> "DSA";
+fmt_hostkey('ssh-ed25519') -> "ED25519";
+fmt_hostkey('ssh-ed448') -> "ED448";
 fmt_hostkey(A) when is_atom(A) -> fmt_hostkey(atom_to_list(A));
 fmt_hostkey("ecdsa"++_) -> "ECDSA";
 fmt_hostkey(X) -> X.
 
 
-known_host_key(#ssh{opts = Opts, key_cb = {KeyCb,KeyCbOpts}, peer = {PeerName,_}} = Ssh, 
+known_host_key(#ssh{opts = Opts, peer = {PeerName,_}} = Ssh, 
 	       Public, Alg) ->
-    UserOpts = ?GET_OPT(user_options, Opts),
-    case is_host_key(KeyCb, Public, PeerName, Alg, [{key_cb_private,KeyCbOpts}|UserOpts]) of
-	{_,true} ->
+    case call_KeyCb(is_host_key, [Public, PeerName, Alg], Opts) of
+	true ->
 	    ok;
-	{_,false} ->
+	false ->
             DoAdd = ?GET_OPT(save_accepted_host, Opts),
 	    case accepted_host(Ssh, PeerName, Public, Opts) of
 		true when DoAdd == true ->
-		    {_,R} = add_host_key(KeyCb, PeerName, Public, [{key_cb_private,KeyCbOpts}|UserOpts]),
-                    R;
+		    call_KeyCb(add_host_key, [PeerName, Public], Opts);
 		true when DoAdd == false ->
                     ok;
 		false ->
@@ -890,13 +902,6 @@ known_host_key(#ssh{opts = Opts, key_cb = {KeyCb,KeyCbOpts}, peer = {PeerName,_}
 	    end
     end.
 	    
-is_host_key(KeyCb, Public, PeerName, Alg, Data) ->
-    {KeyCb, KeyCb:is_host_key(Public, PeerName, Alg, Data)}.
-
-add_host_key(KeyCb, PeerName, Public, Data) ->
-    {KeyCb, KeyCb:add_host_key(PeerName, Public, Data)}.
-    
-
 %%   Each of the algorithm strings MUST be a comma-separated list of
 %%   algorithm names (see ''Algorithm Naming'' in [SSH-ARCH]).  Each
 %%   supported (allowed) algorithm MUST be listed in order of preference.
@@ -1937,6 +1942,11 @@ valid_key_sha_alg(#'RSAPrivateKey'{}, 'ssh-rsa'     ) -> true;
 valid_key_sha_alg({_, #'Dss-Parms'{}}, 'ssh-dss') -> true;
 valid_key_sha_alg(#'DSAPrivateKey'{},  'ssh-dss') -> true;
 
+valid_key_sha_alg({ed_pub, ed25519,_},  'ssh-ed25519') -> true;
+valid_key_sha_alg({ed_pri, ed25519,_,_},'ssh-ed25519') -> true;
+valid_key_sha_alg({ed_pub, ed448,_},    'ssh-ed448') -> true;
+valid_key_sha_alg({ed_pri, ed448,_,_},  'ssh-ed448') -> true;
+
 valid_key_sha_alg({#'ECPoint'{},{namedCurve,OID}},                Alg) -> valid_key_sha_alg_ec(OID, Alg);
 valid_key_sha_alg(#'ECPrivateKey'{parameters = {namedCurve,OID}}, Alg) -> valid_key_sha_alg_ec(OID, Alg);
 valid_key_sha_alg(_, _) -> false.
@@ -1946,11 +1956,16 @@ valid_key_sha_alg_ec(OID, Alg) ->
     Alg == list_to_atom("ecdsa-sha2-" ++ binary_to_list(Curve)).
     
 
+-dialyzer({no_match, public_algo/1}).
+
 public_algo(#'RSAPublicKey'{}) ->   'ssh-rsa';  % FIXME: Not right with draft-curdle-rsa-sha2
 public_algo({_, #'Dss-Parms'{}}) -> 'ssh-dss';
+public_algo({ed_pub, ed25519,_}) -> 'ssh-ed25519';
+public_algo({ed_pub, ed448,_}) -> 'ssh-ed448';
 public_algo({#'ECPoint'{},{namedCurve,OID}}) -> 
     Curve = public_key:oid2ssh_curvename(OID),
     list_to_atom("ecdsa-sha2-" ++ binary_to_list(Curve)).
+
 
 sha('ssh-rsa') -> sha;
 sha('rsa-sha2-256') -> sha256;
@@ -1960,6 +1975,8 @@ sha('ssh-dss') -> sha;
 sha('ecdsa-sha2-nistp256') -> sha(secp256r1);
 sha('ecdsa-sha2-nistp384') -> sha(secp384r1);
 sha('ecdsa-sha2-nistp521') -> sha(secp521r1);
+sha('ssh-ed25519') -> undefined; % Included in the spec of ed25519
+sha('ssh-ed448') -> undefined; % Included in the spec of ed448
 sha(secp256r1) -> sha256;
 sha(secp384r1) -> sha384;
 sha(secp521r1) -> sha512;
@@ -2053,7 +2070,6 @@ ecdh_curve('ecdh-sha2-nistp521') -> secp521r1;
 ecdh_curve('curve448-sha512'   ) -> x448;
 ecdh_curve('curve25519-sha256' ) -> x25519;
 ecdh_curve('curve25519-sha256@libssh.org' ) -> x25519.
-
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%

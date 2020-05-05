@@ -354,6 +354,7 @@ erl_init(int ncpu,
     erts_init_bif();
     erts_init_bif_chksum();
     erts_init_bif_binary();
+    erts_init_bif_persistent_term();
     erts_init_bif_re();
     erts_init_unicode(); /* after RE to get access to PCRE unicode */
     erts_init_external();
@@ -2358,8 +2359,8 @@ system_cleanup(int flush_async)
 	     * The exiting thread might be waiting for
 	     * us to block; need to update status...
 	     */
-	    erts_thr_progress_active(NULL, 0);
-	    erts_thr_progress_prepare_wait(NULL);
+	    erts_thr_progress_active(erts_thr_prgr_data(NULL), 0);
+	    erts_thr_progress_prepare_wait(erts_thr_prgr_data(NULL));
 	}
 	/* Wait forever... */
 	while (1)

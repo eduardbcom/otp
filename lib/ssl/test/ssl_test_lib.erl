@@ -26,6 +26,7 @@
 
 %% Note: This directive should only be used in test suites.
 -compile(export_all).
+-compile(nowarn_export_all).
 
 -record(sslsocket, { fd = nil, pid = nil}).
 -define(SLEEP, 1000).
@@ -195,6 +196,55 @@ connect(ListenSocket, Node, _, _, Timeout, Opts, _) ->
     ct:log("ssl:ssl_accept(~p,~p, ~p)~n", [AcceptSocket, Opts, Timeout]),
     rpc:call(Node, ssl, ssl_accept, [AcceptSocket, Opts, Timeout]),
     AcceptSocket.
+
+
+start_server_transport_abuse_socket(Args) ->
+    Result = spawn_link(?MODULE, transport_accept_abuse, [Args]),
+    receive
+	{listen, up} ->
+	    Result
+    end.
+
+start_server_transport_control(Args) ->
+    Result = spawn_link(?MODULE, transport_switch_control, [Args]),
+    receive
+	{listen, up} ->
+	    Result
+    end.
+
+
+transport_accept_abuse(Opts) ->
+    Node = proplists:get_value(node, Opts),
+    Port = proplists:get_value(port, Opts),
+    Options = proplists:get_value(options, Opts),
+    Pid = proplists:get_value(from, Opts),
+    Transport =  proplists:get_value(transport, Opts, ssl),
+    ct:log("~p:~p~nssl:listen(~p, ~p)~n", [?MODULE,?LINE, Port, Options]),
+    {ok, ListenSocket} = rpc:call(Node, Transport, listen, [Port, Options]),
+    Pid ! {listen, up},
+    send_selected_port(Pid, Port, ListenSocket),
+    {ok, AcceptSocket} = rpc:call(Node, ssl, transport_accept, 
+                                  [ListenSocket]),    
+    {error, _} = rpc:call(Node, ssl, connection_information, [AcceptSocket]),
+    _ = rpc:call(Node, ssl, handshake, [AcceptSocket, infinity]),
+    Pid ! {self(), ok}.
+
+
+transport_switch_control(Opts) ->
+    Node = proplists:get_value(node, Opts),
+    Port = proplists:get_value(port, Opts),
+    Options = proplists:get_value(options, Opts),
+    Pid = proplists:get_value(from, Opts),
+    Transport =  proplists:get_value(transport, Opts, ssl),
+    ct:log("~p:~p~nssl:listen(~p, ~p)~n", [?MODULE,?LINE, Port, Options]),
+    {ok, ListenSocket} = rpc:call(Node, Transport, listen, [Port, Options]),
+    Pid ! {listen, up},
+    send_selected_port(Pid, Port, ListenSocket),
+    {ok, AcceptSocket} = rpc:call(Node, ssl, transport_accept, 
+                                  [ListenSocket]),    
+    ok = rpc:call(Node, ssl, controlling_process, [AcceptSocket, self()]),
+    Pid ! {self(), ok}.
+
 
 remove_close_msg(0) ->
     ok;
@@ -693,8 +743,21 @@ make_mix_cert(Config) ->
     Ext = x509_test:extensions([{key_usage, [digitalSignature]}]),
     Digest = {digest, appropriate_sha(crypto:supports())},
     CurveOid = hd(tls_v1:ecc_curves(0)),
-    ClientFileBase = filename:join([proplists:get_value(priv_dir, Config), "mix"]),
-    ServerFileBase = filename:join([proplists:get_value(priv_dir, Config), "mix"]),
+    Mix = proplists:get_value(mix, Config, peer_ecc),
+    ClientChainType =ServerChainType = mix,
+    {ClientChain, ServerChain} = mix(Mix, Digest, CurveOid, Ext),
+    CertChainConf = gen_conf(ClientChainType, ServerChainType, ClientChain, ServerChain),
+    ClientFileBase = filename:join([proplists:get_value(priv_dir, Config), "mix" ++ atom_to_list(Mix)]),
+    ServerFileBase = filename:join([proplists:get_value(priv_dir, Config), "mix" ++ atom_to_list(Mix)]),
+    GenCertData = public_key:pkix_test_data(CertChainConf),
+    [{server_config, ServerConf}, 
+     {client_config, ClientConf}] = 
+        x509_test:gen_pem_config_files(GenCertData, ClientFileBase, ServerFileBase),               
+    {[{verify, verify_peer} | ClientConf],
+     [{reuseaddr, true}, {verify, verify_peer} | ServerConf]
+    }.
+
+mix(peer_ecc, Digest, CurveOid, Ext) ->
     ClientChain =  [[Digest, {key, {namedCurve, CurveOid}}], 
                     [Digest, {key, hardcode_rsa_key(1)}], 
                     [Digest, {key, {namedCurve, CurveOid}}, {extensions, Ext}]
@@ -703,17 +766,18 @@ make_mix_cert(Config) ->
                     [Digest, {key,  hardcode_rsa_key(2)}], 
                     [Digest, {key, {namedCurve, CurveOid}},{extensions, Ext}]
                    ],
-    ClientChainType =ServerChainType = mix,
-    CertChainConf = gen_conf(ClientChainType, ServerChainType, ClientChain, ServerChain),
-    ClientFileBase = filename:join([proplists:get_value(priv_dir, Config), atom_to_list(ClientChainType)]),
-    ServerFileBase = filename:join([proplists:get_value(priv_dir, Config), atom_to_list(ServerChainType)]),
-    GenCertData = public_key:pkix_test_data(CertChainConf),
-    [{server_config, ServerConf}, 
-     {client_config, ClientConf}] = 
-        x509_test:gen_pem_config_files(GenCertData, ClientFileBase, ServerFileBase),               
-    {[{verify, verify_peer} | ClientConf],
-     [{reuseaddr, true}, {verify, verify_peer} | ServerConf]
-    }.
+    {ClientChain, ServerChain};
+
+mix(peer_rsa, Digest, CurveOid, Ext) ->
+    ClientChain =  [[Digest, {key, {namedCurve, CurveOid}}], 
+                    [Digest, {key, {namedCurve, CurveOid}}], 
+                    [Digest, {key, hardcode_rsa_key(1)}, {extensions, Ext}]
+                   ],
+    ServerChain =  [[Digest, {key, {namedCurve, CurveOid}}], 
+                    [Digest, {key, {namedCurve, CurveOid}}], 
+                    [Digest, {key,  hardcode_rsa_key(2)},{extensions, Ext}]
+                   ],
+    {ClientChain, ServerChain}.
 
 make_ecdsa_cert(Config) ->
     CryptoSupport = crypto:supports(),
@@ -1002,7 +1066,6 @@ ecc_test_error(COpts, SOpts, CECCOpts, SECCOpts, Config) ->
     Client = start_client_ecc_error(erlang, Port, COpts, CECCOpts, Config),
     Error = {error, {tls_alert, "insufficient security"}},
     check_result(Server, Error, Client, Error).
-
 
 start_client(openssl, Port, ClientOpts, Config) ->
     Cert = proplists:get_value(certfile, ClientOpts),
@@ -1644,10 +1707,10 @@ openssl_dsa_support() ->
             true;
         "LibreSSL"  ++ _ ->
             false;
-        "OpenSSL 1.1" ++ Rest ->
+        "OpenSSL 1.1" ++ _Rest ->
             false;
         "OpenSSL 1.0.1" ++ Rest ->
-            hd(Rest) >= s;
+            hd(Rest) >= $s;
         _ ->
             true
     end.
@@ -1681,8 +1744,6 @@ openssl_sane_client_cert() ->
         "LibreSSL 2.3" ++ _ ->
             false; 
          "LibreSSL 2.1" ++ _ ->
-            false; 
-         "LibreSSL 2.0" ++ _ ->
             false; 
          "LibreSSL 2.0" ++ _ ->
             false; 
@@ -2061,3 +2122,40 @@ hardcode_dsa_key(3) ->
        y =  48598545580251057979126570873881530215432219542526130654707948736559463436274835406081281466091739849794036308281564299754438126857606949027748889019480936572605967021944405048011118039171039273602705998112739400664375208228641666852589396502386172780433510070337359132965412405544709871654840859752776060358,
        x = 1457508827177594730669011716588605181448418352823}.
 
+tcp_delivery_workaround(Server, ServerMsg, Client, ClientMsg) ->
+    receive
+	{Server, ServerMsg} ->
+	    client_msg(Client, ClientMsg);
+	{Client, ClientMsg} ->
+	    server_msg(Server, ServerMsg);
+	{Client, {error,closed}} ->
+	    server_msg(Server, ServerMsg);
+	{Server, {error,closed}} ->
+	    client_msg(Client, ClientMsg)
+    end.
+client_msg(Client, ClientMsg) ->
+    receive
+	{Client, ClientMsg} ->
+	    ok;
+	{Client, {error,closed}} ->
+	    ct:log("client got close"),
+	    ok;
+	{Client, {error, Reason}} ->
+	    ct:log("client got econnaborted: ~p", [Reason]),
+	    ok;
+	Unexpected ->
+	    ct:fail(Unexpected)
+    end.
+server_msg(Server, ServerMsg) ->
+    receive
+	{Server, ServerMsg} ->
+	    ok;
+	{Server, {error,closed}} ->
+	    ct:log("server got close"),
+	    ok;
+	{Server, {error, Reason}} ->
+	    ct:log("server got econnaborted: ~p", [Reason]),
+	    ok;
+	Unexpected ->
+	    ct:fail(Unexpected)
+    end.

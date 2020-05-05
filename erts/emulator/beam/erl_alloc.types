@@ -274,8 +274,12 @@ type	ML_YIELD_STATE	SHORT_LIVED	SYSTEM		monitor_link_yield_state
 type	ML_DIST		STANDARD	SYSTEM		monitor_link_dist
 type	PF3_ARGS	SHORT_LIVED	PROCESSES	process_flag_3_arguments
 type	SETUP_CONN_ARG	SHORT_LIVED	PROCESSES	setup_connection_argument
+type    LIST_TRAP       SHORT_LIVED     PROCESSES       list_bif_trap_state
 
 type	ENVIRONMENT	SYSTEM		SYSTEM		environment
+
+type	PERSISTENT_TERM	LONG_LIVED	CODE		persisten_term
+type	PERSISTENT_LOCK_Q SHORT_LIVED	SYSTEM		persistent_lock_q
 
 #
 # Types used for special emulators
@@ -334,6 +338,8 @@ type	GC_INFO_REQ	SHORT_LIVED	SYSTEM		gc_info_request
 type	PORT_DATA_HEAP	STANDARD	SYSTEM		port_data_heap
 type    MSACC           DRIVER          SYSTEM          microstate_accounting
 type	SYS_CHECK_REQ	SHORT_LIVED	SYSTEM		system_check_request
+type	ATOMICS		STANDARD	SYSTEM		erl_bif_atomics
+type	COUNTERS	STANDARD	SYSTEM		erl_bif_counters
 
 #
 # Types used by system specific code

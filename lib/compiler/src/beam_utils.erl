@@ -745,8 +745,11 @@ check_liveness_block_2(R, {gc_bif,Op,{f,Lbl}}, Ss, St) ->
     check_liveness_block_3(R, Lbl, {Op,length(Ss)}, St);
 check_liveness_block_2(R, {bif,Op,{f,Lbl}}, Ss, St) ->
     Arity = length(Ss),
+
+    %% Note that is_function/2 is a type test but is not safe.
     case erl_internal:comp_op(Op, Arity) orelse
-	erl_internal:new_type_test(Op, Arity) of
+	(erl_internal:new_type_test(Op, Arity) andalso
+         erl_bifs:is_safe(erlang, Op, Arity)) of
 	true ->
 	    {killed,St};
 	false ->
@@ -1115,6 +1118,10 @@ defs([{bs_init,{f,L},_,Live,_,Dst}=I|Is], Regs0, D) ->
             end,
     Regs = def_regs([Dst], Regs1),
     [I|defs(Is, Regs, update_regs(L, Regs, D))];
+defs([{test,bs_start_match2,{f,L},Live,_,Dst}=I|Is], _Regs, D) ->
+    Regs0 = init_def_regs(Live),
+    Regs = def_regs([Dst], Regs0),
+    [I|defs(Is, Regs, update_regs(L, Regs0, D))];
 defs([{bs_put,{f,L},_,_}=I|Is], Regs, D) ->
     [I|defs(Is, Regs, update_regs(L, Regs, D))];
 defs([build_stacktrace=I|Is], _Regs, D) ->

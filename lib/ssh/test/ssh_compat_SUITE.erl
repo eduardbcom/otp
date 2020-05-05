@@ -648,6 +648,7 @@ setup_remote_priv_and_local_auth_keys(KeyAlg, IP, Port, UserDir, Config) ->
                                                    {silently_accept_hosts,true},
                                                    {user_interaction,false}
                                                   ]),
+    rm_id_in_remote_dir(Ch, ".ssh"),
     _ = ssh_sftp:make_dir(Ch, ".ssh"),
     DstFile = filename:join(".ssh", dst_filename(user,KeyAlg)),
     ok = ssh_sftp:write_file(Ch, DstFile, Priv),
@@ -657,6 +658,18 @@ setup_remote_priv_and_local_auth_keys(KeyAlg, IP, Port, UserDir, Config) ->
     ok = ssh_sftp:stop_channel(Ch),
     ok = ssh:close(Cc),
     UserDir.
+
+rm_id_in_remote_dir(Ch, Dir) ->
+    case ssh_sftp:list_dir(Ch, Dir) of
+        {error,_Error} ->
+            ok;
+        {ok,FileNames} ->
+            lists:foreach(fun("id_"++_ = F) ->
+                                  ok = ssh_sftp:delete(Ch, filename:join(Dir,F));
+                             (_) ->
+                                  leave
+                          end, FileNames)
+    end.
 
 user_priv_pub_keys(Config, KeyAlg) -> priv_pub_keys("users_keys", user, Config, KeyAlg).
 host_priv_pub_keys(Config, KeyAlg) -> priv_pub_keys("host_keys",  host, Config, KeyAlg).
@@ -673,6 +686,8 @@ src_filename(user, 'ssh-rsa'            ) -> "id_rsa";
 src_filename(user, 'rsa-sha2-256'       ) -> "id_rsa";
 src_filename(user, 'rsa-sha2-512'       ) -> "id_rsa";
 src_filename(user, 'ssh-dss'            ) -> "id_dsa";
+src_filename(user, 'ssh-ed25519'        ) -> "id_ed25519";
+src_filename(user, 'ssh-ed448'          ) -> "id_ed448";
 src_filename(user, 'ecdsa-sha2-nistp256') -> "id_ecdsa256";
 src_filename(user, 'ecdsa-sha2-nistp384') -> "id_ecdsa384";
 src_filename(user, 'ecdsa-sha2-nistp521') -> "id_ecdsa521";
@@ -680,6 +695,8 @@ src_filename(host, 'ssh-rsa'            ) -> "ssh_host_rsa_key";
 src_filename(host, 'rsa-sha2-256'       ) -> "ssh_host_rsa_key";
 src_filename(host, 'rsa-sha2-512'       ) -> "ssh_host_rsa_key";
 src_filename(host, 'ssh-dss'            ) -> "ssh_host_dsa_key";
+src_filename(host, 'ssh-ed25519'        ) -> "ssh_host_ed25519_key";
+src_filename(host, 'ssh-ed448'          ) -> "ssh_host_ed448_key";
 src_filename(host, 'ecdsa-sha2-nistp256') -> "ssh_host_ecdsa_key256";
 src_filename(host, 'ecdsa-sha2-nistp384') -> "ssh_host_ecdsa_key384";
 src_filename(host, 'ecdsa-sha2-nistp521') -> "ssh_host_ecdsa_key521".
@@ -688,6 +705,8 @@ dst_filename(user, 'ssh-rsa'            ) -> "id_rsa";
 dst_filename(user, 'rsa-sha2-256'       ) -> "id_rsa";
 dst_filename(user, 'rsa-sha2-512'       ) -> "id_rsa";
 dst_filename(user, 'ssh-dss'            ) -> "id_dsa";
+dst_filename(user, 'ssh-ed25519'        ) -> "id_ed25519";
+dst_filename(user, 'ssh-ed448'          ) -> "id_ed448";
 dst_filename(user, 'ecdsa-sha2-nistp256') -> "id_ecdsa";
 dst_filename(user, 'ecdsa-sha2-nistp384') -> "id_ecdsa";
 dst_filename(user, 'ecdsa-sha2-nistp521') -> "id_ecdsa";
@@ -695,6 +714,8 @@ dst_filename(host, 'ssh-rsa'            ) -> "ssh_host_rsa_key";
 dst_filename(host, 'rsa-sha2-256'       ) -> "ssh_host_rsa_key";
 dst_filename(host, 'rsa-sha2-512'       ) -> "ssh_host_rsa_key";
 dst_filename(host, 'ssh-dss'            ) -> "ssh_host_dsa_key";
+dst_filename(host, 'ssh-ed25519'        ) -> "ssh_host_ed25519_key";
+dst_filename(host, 'ssh-ed448'          ) -> "ssh_host_ed448_key";
 dst_filename(host, 'ecdsa-sha2-nistp256') -> "ssh_host_ecdsa_key";
 dst_filename(host, 'ecdsa-sha2-nistp384') -> "ssh_host_ecdsa_key";
 dst_filename(host, 'ecdsa-sha2-nistp521') -> "ssh_host_ecdsa_key".

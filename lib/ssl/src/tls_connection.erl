@@ -46,7 +46,7 @@
 -export([start_fsm/8, start_link/8, init/1, pids/1]).
 
 %% State transition handling	 
--export([next_record/1, next_event/3, next_event/4, 
+-export([next_event/3, next_event/4, 
          handle_common_event/4]).
 
 %% Handshake handling
@@ -56,10 +56,12 @@
          empty_connection_state/2]).
 
 %% Alert and close handling
--export([send_alert/2, send_alert_in_connection/2, encode_alert/3, close/5, protocol_name/0]).
+-export([send_alert/2, send_alert_in_connection/2,
+         send_sync_alert/2,
+         encode_alert/3, close/5, protocol_name/0]).
 
 %% Data handling
--export([encode_data/3, passive_receive/2, next_record_if_active/1, 
+-export([encode_data/3, next_record/1,
          send/3, socket/5, setopts/3, getopts/3]).
 
 %% gen_statem state functions
@@ -159,30 +161,30 @@ next_record(#state{protocol_buffers =
 	    {Alert, State}
     end;
 next_record(#state{protocol_buffers = #protocol_buffers{tls_packets = [], tls_cipher_texts = []},
-		   socket = Socket,
+                   protocol_specific = #{active_n_toggle := true, active_n := N} = ProtocolSpec,
+ 		   socket = Socket,
                    close_tag = CloseTag,
 		   transport_cb = Transport} = State) ->
-    case tls_socket:setopts(Transport, Socket, [{active,once}]) of
-	ok ->
-	    {no_record, State};
-	_ ->
-            self() ! {CloseTag, Socket},
-	    {no_record, State}
-    end;
+     case tls_socket:setopts(Transport, Socket, [{active, N}]) of
+ 	ok ->
+             {no_record, State#state{protocol_specific = ProtocolSpec#{active_n_toggle => false}}}; 
+ 	_ ->
+             self() ! {CloseTag, Socket},
+             {no_record, State}
+     end;
 next_record(State) ->
     {no_record, State}.
 
 next_event(StateName, Record, State) ->
     next_event(StateName, Record, State, []).
-
-next_event(connection = StateName, no_record, State0, Actions) ->
-    case next_record_if_active(State0) of
-	{no_record, State} ->
-	    ssl_connection:hibernate_after(StateName, State, Actions);
-	{#ssl_tls{} = Record, State} ->
-	    {next_state, StateName, State, [{next_event, internal, {protocol_record, Record}} | Actions]};
-	{#alert{} = Alert, State} ->
-	    {next_state, StateName, State, [{next_event, internal, Alert} | Actions]}
+next_event(StateName, no_record, State0, Actions) ->
+    case next_record(State0) of
+ 	{no_record, State} ->
+            {next_state, StateName, State, Actions};
+ 	{#ssl_tls{} = Record, State} ->
+ 	    {next_state, StateName, State, [{next_event, internal, {protocol_record, Record}} | Actions]};
+ 	{#alert{} = Alert, State} ->
+ 	    {next_state, StateName, State, [{next_event, internal, Alert} | Actions]}
     end;
 next_event(StateName, Record, State, Actions) ->
     case Record of
@@ -205,22 +207,21 @@ handle_common_event(internal,  #ssl_tls{type = ?HANDSHAKE, fragment = Data},
 				      ssl_options = Options} = State0) ->
     try
 	{Packets, Buf} = tls_handshake:get_tls_handshake(Version,Data,Buf0, Options),
-	State1 =
+	State =
 	    State0#state{protocol_buffers =
 			     Buffers#protocol_buffers{tls_handshake_buffer = Buf}},
 	case Packets of
             [] -> 
                 assert_buffer_sanity(Buf, Options),
-                {Record, State} = next_record(State1),
-                next_event(StateName, Record, State);
+                next_event(StateName, no_record, State);
             _ ->                
                 Events = tls_handshake_events(Packets),
                 case StateName of
                     connection ->
-                        ssl_connection:hibernate_after(StateName, State1, Events);
+                        ssl_connection:hibernate_after(StateName, State, Events);
                     _ ->
                         {next_state, StateName, 
-                         State1#state{unprocessed_handshake_events = unprocessed_events(Events)}, Events}
+                         State#state{unprocessed_handshake_events = unprocessed_events(Events)}, Events}
                 end
         end
     catch throw:#alert{} = Alert ->
@@ -275,11 +276,10 @@ renegotiate(#state{role = server,
     {BinMsg, ConnectionStates} = 
 	tls_record:encode_handshake(Frag, Version, ConnectionStates0),
     send(Transport, Socket, BinMsg),
-    State1 = State0#state{connection_states = 
+    State = State0#state{connection_states = 
 			     ConnectionStates,
 			 tls_handshake_history = Hs0},
-    {Record, State} = next_record(State1),
-    next_event(hello, Record, State, Actions).
+    next_event(hello, no_record, State, Actions).
 	     
 send_handshake(Handshake, State) ->
     send_handshake_flight(queue_handshake(Handshake, State)).
@@ -346,16 +346,32 @@ encode_alert(#alert{} = Alert, Version, ConnectionStates) ->
 
 send_alert(Alert, #state{negotiated_version = Version,
                          socket = Socket,
-                         protocol_cb = Connection, 
                          transport_cb = Transport,
                          connection_states = ConnectionStates0} = StateData0) ->
     {BinMsg, ConnectionStates} =
-	Connection:encode_alert(Alert, Version, ConnectionStates0),
-    Connection:send(Transport, Socket, BinMsg),
+        encode_alert(Alert, Version, ConnectionStates0),
+    send(Transport, Socket, BinMsg),
     StateData0#state{connection_states = ConnectionStates}.
 
-send_alert_in_connection(Alert, #state{protocol_specific = #{sender := Sender}}) ->
+%% If an ALERT sent in the connection state, should cause the TLS
+%% connection to end, we need to synchronize with the tls_sender
+%% process so that the ALERT if possible (that is the tls_sender process is
+%% not blocked) is sent before the connection process terminates and
+%% thereby closes the transport socket.
+send_alert_in_connection(#alert{level = ?FATAL} = Alert, State) ->
+    send_sync_alert(Alert, State);
+send_alert_in_connection(#alert{description = ?CLOSE_NOTIFY} = Alert, State) ->
+    send_sync_alert(Alert, State);
+send_alert_in_connection(Alert,
+                         #state{protocol_specific = #{sender := Sender}}) ->
     tls_sender:send_alert(Sender, Alert).
+send_sync_alert(
+  Alert, #state{protocol_specific = #{sender := Sender}} = State) ->
+    try tls_sender:send_and_ack_alert(Sender, Alert)
+    catch
+        _:_ ->
+            throw({stop, {shutdown, own_alert}, State})
+    end.
 
 %% User closes or recursive call!
 close({close, Timeout}, Socket, Transport = gen_tcp, _,_) ->
@@ -390,23 +406,6 @@ protocol_name() ->
 %%====================================================================	     
 encode_data(Data, Version, ConnectionStates0)->
     tls_record:encode_data(Data, Version, ConnectionStates0).
-
-passive_receive(State0 = #state{user_data_buffer = Buffer}, StateName) -> 
-    case Buffer of
-	<<>> ->
-	    {Record, State} = next_record(State0),
-	    next_event(StateName, Record, State);
-	_ ->
-	    {Record, State} = ssl_connection:read_application_data(<<>>, State0),
-	    next_event(StateName, Record, State)
-    end.
-
-next_record_if_active(State = 
-		      #state{socket_options = 
-			     #socket_options{active = false}}) -> 
-    {no_record ,State};
-next_record_if_active(State) ->
-    next_record(State).
 
 send(Transport, Socket, Data) ->
    tls_socket:send(Transport, Socket, Data).
@@ -449,15 +448,14 @@ init({call, From}, {start, Timeout},
     {BinMsg, ConnectionStates, Handshake} =
         encode_handshake(Hello,  HelloVersion, ConnectionStates0, Handshake0),
     send(Transport, Socket, BinMsg),
-    State1 = State0#state{connection_states = ConnectionStates,
-			  negotiated_version = Version, %% Requested version
-			  session =
-			      Session0#session{session_id = Hello#client_hello.session_id},
-			  tls_handshake_history = Handshake,
-			  start_or_recv_from = From,
+    State = State0#state{connection_states = ConnectionStates,
+                         negotiated_version = Version, %% Requested version
+                         session =
+                             Session0#session{session_id = Hello#client_hello.session_id},
+                         tls_handshake_history = Handshake,
+                         start_or_recv_from = From,
 			  timer = Timer},
-    {Record, State} = next_record(State1),
-    next_event(hello, Record, State);
+    next_event(hello, no_record, State);
 init(Type, Event, State) ->
     gen_handshake(?FUNCTION_NAME, Type, Event, State).
  
@@ -505,7 +503,9 @@ hello(internal, #client_hello{client_version = ClientVersion} = Hello,
     case tls_handshake:hello(Hello, SslOpts, {Port, Session0, Cache, CacheCb,
 					      ConnectionStates0, Cert, KeyExAlg}, Renegotiation) of
         #alert{} = Alert ->
-            ssl_connection:handle_own_alert(Alert, ClientVersion, hello, State);
+            ssl_connection:handle_own_alert(Alert, ClientVersion, hello,
+                                            State#state{negotiated_version
+                                                        = ClientVersion});
         {Version, {Type, Session},
 	 ConnectionStates, Protocol0, ServerHelloExt, HashSign} ->
 	    Protocol = case Protocol0 of
@@ -528,7 +528,8 @@ hello(internal, #server_hello{} = Hello,
 	     ssl_options = SslOptions} = State) ->
     case tls_handshake:hello(Hello, SslOptions, ConnectionStates0, Renegotiation) of
 	#alert{} = Alert ->
-	    ssl_connection:handle_own_alert(Alert, ReqVersion, hello, State);
+	    ssl_connection:handle_own_alert(Alert, ReqVersion, hello,
+                                            State#state{negotiated_version = ReqVersion});
 	{Version, NewId, ConnectionStates, ProtoExt, Protocol} ->
 	    ssl_connection:handle_session(Hello, 
 					  Version, NewId, ConnectionStates, ProtoExt, Protocol, State)
@@ -589,36 +590,33 @@ connection(internal, #hello_request{},
 		  connection_states = ConnectionStates} = State0) ->
     Hello = tls_handshake:client_hello(Host, Port, ConnectionStates, SslOpts,
 				       Cache, CacheCb, Renegotiation, Cert),
-    {State1, Actions} = send_handshake(Hello, State0),
-    {Record, State} =
-	next_record(
-	  State1#state{session = Session0#session{session_id
-						  = Hello#client_hello.session_id}}),
-    next_event(hello, Record, State, Actions);
+    {State, Actions} = send_handshake(Hello, State0),
+    next_event(hello, no_record, State#state{session = Session0#session{session_id
+                                                                        = Hello#client_hello.session_id}}, Actions);
 connection(internal, #client_hello{} = Hello, 
 	   #state{role = server, allow_renegotiate = true, connection_states = CS,
                   %%protocol_cb = Connection,
                   protocol_specific = #{sender := Sender}
-                 } = State0) ->
+                 } = State) ->
     %% Mitigate Computational DoS attack
     %% http://www.educatedguesswork.org/2011/10/ssltls_and_computational_dos.html
     %% http://www.thc.org/thc-ssl-dos/ Rather than disabling client
     %% initiated renegotiation we will disallow many client initiated
     %% renegotiations immediately after each other.
     erlang:send_after(?WAIT_TO_ALLOW_RENEGOTIATION, self(), allow_renegotiate),
-    {Record, State} = next_record(State0#state{allow_renegotiate = false,
-					       renegotiation = {true, peer}}),
     {ok, Write} = tls_sender:renegotiate(Sender),
-    next_event(hello, Record, State#state{connection_states = CS#{current_write => Write}}, 
+    next_event(hello, no_record, State#state{connection_states = CS#{current_write => Write},
+                                             allow_renegotiate = false,
+                                             renegotiation = {true, peer}
+                                            }, 
                [{next_event, internal, Hello}]);
 connection(internal, #client_hello{}, 
 	   #state{role = server, allow_renegotiate = false,
                   protocol_cb = Connection} = State0) ->
     Alert = ?ALERT_REC(?WARNING, ?NO_RENEGOTIATION),
     send_alert_in_connection(Alert, State0),
-    State1 = Connection:reinit_handshake_data(State0),
-    {Record, State} = next_record(State1),
-    next_event(?FUNCTION_NAME, Record, State);
+    State = Connection:reinit_handshake_data(State0),
+    next_event(?FUNCTION_NAME, no_record, State);
 connection(Type, Event, State) ->
     ssl_connection:?FUNCTION_NAME(Type, Event, State, ?MODULE).
 
@@ -635,9 +633,15 @@ downgrade(Type, Event, State) ->
 callback_mode() ->
     state_functions.
 
+
+terminate(
+  {shutdown, sender_died, Reason}, _StateName,
+  #state{socket = Socket, transport_cb = Transport} = State) ->
+    ssl_connection:handle_trusted_certs_db(State),
+    close(Reason, Socket, Transport, undefined, undefined);
 terminate(Reason, StateName, State) ->
-    ensure_sender_terminate(Reason, State),
-    catch ssl_connection:terminate(Reason, StateName, State).
+    catch ssl_connection:terminate(Reason, StateName, State),
+    ensure_sender_terminate(Reason, State).
 
 format_status(Type, Data) ->
     ssl_connection:format_status(Type, Data).
@@ -661,6 +665,13 @@ initial_state(Role, Sender, Host, Port, Socket, {SSLOptions, SocketOptions, Trac
 			 _  ->
 			     ssl_session_cache
 		     end,
+
+    InternalActiveN =  case application:get_env(ssl, internal_active_n) of
+                           {ok, N} when is_integer(N) andalso (not IsErlDist) ->
+                               N;
+                           _  ->
+                               ?INTERNAL_ACTIVE_N
+                       end,
     
     UserMonitor = erlang:monitor(process, User),
 
@@ -687,7 +698,10 @@ initial_state(Role, Sender, Host, Port, Socket, {SSLOptions, SocketOptions, Trac
 	   protocol_cb = ?MODULE,
 	   tracker = Tracker,
 	   flight_buffer = [],
-           protocol_specific = #{sender => Sender}
+           protocol_specific = #{sender => Sender,
+                                 active_n => InternalActiveN,
+                                 active_n_toggle => true
+                                }
 	  }.
 
 erl_dist_data(true) ->
@@ -748,7 +762,8 @@ tls_handshake_events(Packets) ->
 
 %% raw data from socket, upack records
 handle_info({Protocol, _, Data}, StateName,
-            #state{data_tag = Protocol} = State0) ->
+            #state{data_tag = Protocol
+                  } = State0) ->
     case next_tls_record(Data, StateName, State0) of
 	{Record, State} ->
 	    next_event(StateName, Record, State);
@@ -756,10 +771,16 @@ handle_info({Protocol, _, Data}, StateName,
 	    ssl_connection:handle_normal_shutdown(Alert, StateName, State0), 
 	    ssl_connection:stop({shutdown, own_alert}, State0)
     end;
+handle_info({tcp_passive, Socket},  StateName, #state{socket = Socket,
+                                                      protocol_specific = PS
+                                                     } = State) ->
+    next_event(StateName, no_record, State#state{protocol_specific = PS#{active_n_toggle => true}});
 handle_info({CloseTag, Socket}, StateName,
             #state{socket = Socket, close_tag = CloseTag,
                    socket_options = #socket_options{active = Active},
                    protocol_buffers = #protocol_buffers{tls_cipher_texts = CTs},
+                   user_data_buffer = Buffer,
+                   protocol_specific = PS,
 		   negotiated_version = Version} = State) ->
 
     %% Note that as of TLS 1.1,
@@ -767,7 +788,7 @@ handle_info({CloseTag, Socket}, StateName,
     %% session not be resumed.  This is a change from TLS 1.0 to conform
     %% with widespread implementation practice.
 
-    case (Active == false) andalso (CTs =/= []) of
+    case (Active == false) andalso ((CTs =/= []) or (Buffer =/= <<>>)) of
         false ->
             case Version of
                 {1, N} when N >= 1 ->
@@ -785,11 +806,12 @@ handle_info({CloseTag, Socket}, StateName,
         true ->
             %% Fixes non-delivery of final TLS record in {active, once}.
             %% Basically allows the application the opportunity to set {active, once} again
-            %% and then receive the final message.
-            next_event(StateName, no_record, State)
+            %% and then receive the final message. Set internal active_n to zero 
+            %% to ensure socket close message is sent if there is not enough data to deliver.
+            next_event(StateName, no_record, State#state{protocol_specific = PS#{active_n_toggle => true}})
     end;
-handle_info({'EXIT', Pid, Reason}, _,
-            #state{protocol_specific = Pid} = State) ->
+handle_info({'EXIT', Sender, Reason}, _,
+            #state{protocol_specific = #{sender := Sender}} = State) ->
     {stop, {shutdown, sender_died, Reason}, State};
 handle_info(Msg, StateName, State) ->
     ssl_connection:StateName(info, Msg, State, ?MODULE).

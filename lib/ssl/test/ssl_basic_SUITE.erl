@@ -244,7 +244,9 @@ error_handling_tests()->
      recv_active_once,
      recv_error_handling,
      call_in_error_state,
-     close_in_error_state
+     close_in_error_state,
+     abuse_transport_accept_socket,
+     controlling_process_transport_accept_socket
     ].
 
 error_handling_tests_tls()->
@@ -1095,16 +1097,19 @@ tls_closed_in_active_once(Config) when is_list(Config) ->
     end.
 
 tls_closed_in_active_once_loop(Socket) ->
-    ssl:setopts(Socket, [{active, once}]),
-    receive
-	{ssl, Socket, _} ->
-	    tls_closed_in_active_once_loop(Socket);
-	{ssl_closed, Socket} ->
-	    ok
-    after 5000 ->
-	      no_ssl_closed_received
+    case ssl:setopts(Socket, [{active, once}]) of
+        ok ->
+            receive
+                {ssl, Socket, _} ->
+                    tls_closed_in_active_once_loop(Socket);
+                {ssl_closed, Socket} ->
+                    ok
+            after 5000 ->
+                    no_ssl_closed_received
+            end;
+        {error, closed} ->
+            ok
     end.
-
 %%--------------------------------------------------------------------
 connect_dist() ->
     [{doc,"Test a simple connect as is used by distribution"}].
@@ -1183,16 +1188,16 @@ fallback(Config) when is_list(Config) ->
     
     Port = ssl_test_lib:inet_port(Server),
     
-    Client =
-	ssl_test_lib:start_client_error([{node, ClientNode}, 
-					 {port, Port}, {host, Hostname},
-					 {from, self()},  {options, 
-							   [{fallback, true}, 
-							    {versions, ['tlsv1']} 
-							    | ClientOpts]}]),
+    Client = 
+        ssl_test_lib:start_client_error([{node, ClientNode},
+                                         {port, Port}, {host, Hostname},
+                                         {from, self()},  {options,
+                                                           [{fallback, true},
+                                                            {versions, ['tlsv1']}
+                                                            | ClientOpts]}]),
     
-    ssl_test_lib:check_result(Server, {error,{tls_alert,"inappropriate fallback"}}, 
-			      Client, {error,{tls_alert,"inappropriate fallback"}}).
+    ssl_test_lib:check_result(Server, {error,{tls_alert,"inappropriate fallback"}},
+                              Client, {error,{tls_alert,"inappropriate fallback"}}).
 
 %%--------------------------------------------------------------------
 cipher_format() ->
@@ -2645,14 +2650,14 @@ default_reject_anonymous(Config) when is_list(Config) ->
 					      {options, ServerOpts}]),
     Port = ssl_test_lib:inet_port(Server),
     Client = ssl_test_lib:start_client_error([{node, ClientNode}, {port, Port},
-					{host, Hostname},
-			   {from, self()},
-			   {options,
-			    [{ciphers,[CipherSuite]} |
-			     ClientOpts]}]),
+                                              {host, Hostname},
+                                              {from, self()},
+                                              {options,
+                                               [{ciphers,[CipherSuite]} |
+                                                ClientOpts]}]),
 
     ssl_test_lib:check_result(Server, {error, {tls_alert, "insufficient security"}},
-			      Client, {error, {tls_alert, "insufficient security"}}).
+                              Client, {error, {tls_alert, "insufficient security"}}).
 
 %%--------------------------------------------------------------------
 ciphers_ecdsa_signed_certs() ->
@@ -3605,14 +3610,14 @@ no_common_signature_algs(Config) when is_list(Config) ->
 							 | ServerOpts]}]),
     Port = ssl_test_lib:inet_port(Server),
     Client = ssl_test_lib:start_client_error([{node, ClientNode}, {port, Port},
-					      {host, Hostname},
-					      {from, self()}, 
-					      {options, [{signature_algs, [{sha384, rsa}]}
-							 | ClientOpts]}]),
+                                              {host, Hostname},
+                                              {from, self()},
+                                              {options, [{signature_algs, [{sha384, rsa}]}
+                                                         | ClientOpts]}]),
     
     ssl_test_lib:check_result(Server, {error, {tls_alert, "insufficient security"}},
-			      Client, {error, {tls_alert, "insufficient security"}}).
-    						
+                              Client, {error, {tls_alert, "insufficient security"}}).
+
 %%--------------------------------------------------------------------
 
 tls_dont_crash_on_handshake_garbage() ->
@@ -4054,7 +4059,51 @@ close_in_error_state(Config) when is_list(Config) ->
         Other ->
             ct:fail(Other)
     end.
+%%--------------------------------------------------------------------
+abuse_transport_accept_socket() ->
+    [{doc,"Only ssl:handshake and ssl:controlling_process is allowed for transport_accept:sockets"}].
+abuse_transport_accept_socket(Config) when is_list(Config) ->
+    ServerOpts = ssl_test_lib:ssl_options(server_opts, Config),
+    ClientOpts = ssl_test_lib:ssl_options(client_opts, Config),
+    {ClientNode, ServerNode, Hostname} = ssl_test_lib:run_where(Config),
 
+    Server = ssl_test_lib:start_server_transport_abuse_socket([{node, ServerNode}, 
+                                                               {port, 0},
+                                                               {from, self()},
+                                                               {options, ServerOpts}]),
+    Port = ssl_test_lib:inet_port(Server),
+    Client = ssl_test_lib:start_client([{node, ClientNode}, {port, Port},
+                                        {host, Hostname},
+                                        {from, self()},
+                                        {mfa, {ssl_test_lib, no_result, []}},
+                                        {options, ClientOpts}]),
+    ssl_test_lib:check_result(Server, ok),
+    ssl_test_lib:close(Server),
+    ssl_test_lib:close(Client).
+    
+
+%%--------------------------------------------------------------------
+controlling_process_transport_accept_socket() ->
+    [{doc,"Only ssl:handshake and ssl:controlling_process is allowed for transport_accept:sockets"}].
+controlling_process_transport_accept_socket(Config) when is_list(Config) ->
+    ServerOpts = ssl_test_lib:ssl_options(server_opts, Config),
+    ClientOpts = ssl_test_lib:ssl_options(client_opts, Config),
+    {ClientNode, ServerNode, Hostname} = ssl_test_lib:run_where(Config),
+
+    Server = ssl_test_lib:start_server_transport_control([{node, ServerNode}, 
+                                                          {port, 0},
+                                                          {from, self()},
+                                                          {options, ServerOpts}]),
+    Port = ssl_test_lib:inet_port(Server),
+    
+    _Client = ssl_test_lib:start_client_error([{node, ClientNode}, {port, Port},
+                                              {host, Hostname},
+                                              {from, self()},
+                                              {options, ClientOpts}]),
+    ssl_test_lib:check_result(Server, ok),
+    ssl_test_lib:close(Server).
+
+%%--------------------------------------------------------------------
 run_error_server_close([Pid | Opts]) ->
     {ok, Listen} = ssl:listen(0, Opts),
     {ok,{_, Port}} = ssl:sockname(Listen),
@@ -5174,14 +5223,14 @@ get_invalid_inet_option(Socket) ->
 
 tls_shutdown_result(Socket, server) ->
     ssl:send(Socket, "Hej"),
-    ssl:shutdown(Socket, write),
+    ok = ssl:shutdown(Socket, write),
     {ok, "Hej hopp"} = ssl:recv(Socket, 8),
     ok;
 
 tls_shutdown_result(Socket, client) ->
-    {ok, "Hej"} = ssl:recv(Socket, 3),
     ssl:send(Socket, "Hej hopp"),
-    ssl:shutdown(Socket, write),
+    ok = ssl:shutdown(Socket, write),
+    {ok, "Hej"} = ssl:recv(Socket, 3),
     ok.
 
 tls_shutdown_write_result(Socket, server) ->

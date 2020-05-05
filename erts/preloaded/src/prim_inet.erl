@@ -49,9 +49,15 @@
 -include("inet_sctp.hrl").
 -include("inet_int.hrl").
 
-%-define(DEBUG, 1).
+%%%-define(DEBUG, 1).
 -ifdef(DEBUG).
--define(DBG_FORMAT(Format, Args), (io:format((Format), (Args)))).
+-define(
+   DBG_FORMAT(Format, Args),
+   begin
+       %% io:format((Format), (Args)),
+       erlang:display(lists:flatten(io_lib:format((Format), (Args)))),
+       ok
+   end).
 -else.
 -define(DBG_FORMAT(Format, Args), ok).
 -endif.
@@ -150,39 +156,96 @@ shutdown_1(S, How) ->
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 close(S) when is_port(S) ->
+    ?DBG_FORMAT("prim_inet:close(~p)~n", [S]),
     case getopt(S, linger) of
     	{ok,{true,0}} -> 
 	    close_port(S);
-	_ ->
-	    case subscribe(S, [subs_empty_out_q]) of
-		{ok, [{subs_empty_out_q,N}]} when N > 0 ->
-		    close_pend_loop(S, N);   %% wait for pending output to be sent
-		_ ->
-		    close_port(S)
-	    end
+        {ok,{true,T}} ->
+            %% Wait for T seconds for pending output to be sent
+            %%
+            %% Note that this handling of Linger may look ok,
+            %% but sweeps some problems under the rug since
+            %% there are OS buffers that may have remaining data
+            %% after the inet driver has emptied its buffers.
+            %% But Linger for nonblocking sockets is broken
+            %% anyway on all OS:es, according to hearsay,
+            %% and is a contradiction in itself.
+            %% We have hereby done our best...
+            %%
+            Tref = erlang:start_timer(T * 1000, self(), close_port),
+            close_pend_loop(S, Tref, undefined);
+	_ -> % Regard this as {ok,{false,_}}
+            case subscribe(S, [subs_empty_out_q]) of
+                {ok, [{subs_empty_out_q,N}]} when N > 0 ->
+                    %% Wait for pending output to be sent
+                    DefaultT = 180000, % Arbitrary system timeout 3 min
+                    Tref = erlang:start_timer(DefaultT, self(), close_port),
+                    close_pend_loop(S, Tref, N);
+                _ ->
+                    %% Subscribe failed or empty out q - give up or done
+                    close_port(S)
+            end
     end.
 
-close_pend_loop(S, N) ->
+close_pend_loop(S, Tref, N) ->
+    ?DBG_FORMAT("prim_inet:close_pend_loop(~p, _, ~p)~n", [S,N]),
     receive
-	{empty_out_q,S} ->
-	    close_port(S)
+        {timeout,Tref,_} -> % Linger timeout
+            ?DBG_FORMAT("prim_inet:close_pend_loop(~p, _, _) timeout~n", [S]),
+	    close_port(S);
+	{empty_out_q,S} when N =/= undefined ->
+            ?DBG_FORMAT(
+               "prim_inet:close_pend_loop(~p, _, _) empty_out_q~n", [S]),
+	    close_port(S, Tref)
     after ?INET_CLOSE_TIMEOUT ->
 	    case getstat(S, [send_pend]) of
                 {ok, [{send_pend,N1}]} ->
+                    ?DBG_FORMAT(
+                       "prim_inet:close_pend_loop(~p, _, _) send_pend ~p~n",
+                       [S,N1]),
                     if
-			N1 =:= N ->
-			    close_port(S);
-                       true ->
-			    close_pend_loop(S, N1)
+                        N1 =:= 0 ->
+                            %% Empty outq - done
+                            close_port(S, Tref);
+                        N =:= undefined ->
+                            %% Within linger time - wait some more
+                            close_pend_loop(S, Tref, N);
+                        N1 =:= N ->
+                            %% Inactivity - give up
+                            close_port(S, Tref);
+                        true ->
+                            %% Still moving - wait some more
+                            close_pend_loop(S, Tref, N)
                     end;
-		_ ->
-		    close_port(S)
-	    end
+                _Stat ->
+                    %% Failed getstat - give up
+                    ?DBG_FORMAT(
+                       "prim_inet:close_pend_loop(~p, _, _) getstat ~p~n",
+                       [S,_Stat]),
+		    close_port(S, Tref)
+            end
     end.
 
+
+close_port(S, Tref) ->
+    ?DBG_FORMAT("prim_inet:close_port(~p, _)~n", [S]),
+    case erlang:cancel_timer(Tref) of
+        false ->
+            receive
+                {timeout,Tref,_} ->
+                    ok
+            end;
+        _N ->
+            ok
+    end,
+    close_port(S).
+%%
 close_port(S) ->
-    catch erlang:port_close(S),
-    receive {'EXIT',S,_} -> ok after 0 -> ok end.
+    ?DBG_FORMAT("prim_inet:close_port(~p)~n", [S]),
+    _Closed = (catch erlang:port_close(S)),
+    receive {'EXIT',S,_} -> ok after 0 -> ok end,
+    ?DBG_FORMAT("prim_inet:close_port(~p) ~p~n", [S,_Closed]),
+    ok.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%
@@ -424,22 +487,48 @@ peeloff(S, AssocId) ->
 %% be called directly -- use "sendmsg" instead:
 %%
 send(S, Data, OptList) when is_port(S), is_list(OptList) ->
-    ?DBG_FORMAT("prim_inet:send(~p, ~p)~n", [S,Data]),
+    ?DBG_FORMAT("prim_inet:send(~p, _, ~p)~n", [S,OptList]),
     try erlang:port_command(S, Data, OptList) of
 	false -> % Port busy and nosuspend option passed
 	    ?DBG_FORMAT("prim_inet:send() -> {error,busy}~n", []),
 	    {error,busy};
 	true ->
-	    receive
-		{inet_reply,S,Status} ->
-		    ?DBG_FORMAT("prim_inet:send() -> ~p~n", [Status]),
-		    Status
-	    end
+            send_recv_reply(S, undefined)
     catch
 	error:_Error ->
 	    ?DBG_FORMAT("prim_inet:send() -> {error,einval}~n", []),
 	     {error,einval}
     end.
+
+send_recv_reply(S, Mref) ->
+    ReplyTimeout =
+        case Mref of
+            undefined ->
+                ?INET_CLOSE_TIMEOUT;
+            _ ->
+                infinity
+        end,
+    receive
+        {inet_reply,S,Status} ->
+            ?DBG_FORMAT(
+               "prim_inet:send_recv_reply(~p, _): inet_reply ~p~n",
+               [S,Status]),
+            case Mref of
+                undefined -> ok;
+                _ ->
+                    demonitor(Mref, [flush]),
+                    ok
+            end,
+            Status;
+        {'DOWN',Mref,_,_,_Reason} when Mref =/= undefined ->
+            ?DBG_FORMAT(
+               "prim_inet:send_recv_reply(~p, _) 'DOWN' ~p~n",
+               [S,_Reason]),
+            {error,closed}
+    after ReplyTimeout ->
+            send_recv_reply(S, monitor(port, S))
+    end.
+
 
 send(S, Data) ->
     send(S, Data, []).
@@ -520,12 +609,34 @@ sendfile(S, FileHandle, Offset, Length)
 sendfile(S, FileHandle, Offset, Length) ->
     case erlang:port_info(S, connected) of
         {connected, Pid} when Pid =:= self() ->
-            sendfile_1(S, FileHandle, Offset, Length);
+            Uncork = sendfile_maybe_cork(S),
+            Result = sendfile_1(S, FileHandle, Offset, Length),
+            sendfile_maybe_uncork(S, Uncork),
+            Result;
         {connected, Pid} when Pid =/= self() ->
             {error, not_owner};
         _Other ->
             {error, einval}
     end.
+
+sendfile_maybe_cork(S) ->
+    case getprotocol(S) of
+        tcp ->
+            case getopts(S, [nopush]) of
+                {ok, [{nopush,false}]} ->
+                    _ = setopts(S, [{nopush,true}]),
+                    true;
+                _ ->
+                    false
+            end;
+        _ -> false
+    end.
+
+sendfile_maybe_uncork(S, true) ->
+    _ = setopts(S, [{nopush,false}]),
+    ok;
+sendfile_maybe_uncork(_, false) ->
+    ok.
 
 sendfile_1(S, FileHandle, Offset, 0) ->
     sendfile_1(S, FileHandle, Offset, (1 bsl 63) - 1);
@@ -870,9 +981,9 @@ chgopts(S, Opts) when is_port(S), is_list(Opts) ->
 
 getifaddrs(S) when is_port(S) ->
     case ctl_cmd(S, ?INET_REQ_GETIFADDRS, []) of
-	{ok, Data} ->
-	    {ok, comp_ifaddrs(build_ifaddrs(Data), ktree_empty())};
-	{error,enotsup} ->
+        {ok, Data} ->
+            {ok, comp_ifaddrs(build_ifaddrs(Data))};
+        {error,enotsup} ->
 	    case getiflist(S) of
 		{ok, IFs} ->
 		    {ok, getifaddrs_ifget(S, IFs)};
@@ -881,30 +992,75 @@ getifaddrs(S) when is_port(S) ->
 	Err2 -> Err2
     end.
 
-%% Restructure interface properties per interface and remove duplicates
+%% Restructure interface properties per interface
 
-comp_ifaddrs([{If,Opts}|IfOpts], T) ->
-    case ktree_is_defined(If, T) of
-	true ->
-	    OptSet = comp_ifaddrs_add(ktree_get(If, T), Opts),
-	    comp_ifaddrs(IfOpts, ktree_update(If, OptSet, T));
-	false ->
-	    OptSet = comp_ifaddrs_add(ktree_empty(), Opts),
-	    comp_ifaddrs(IfOpts, ktree_insert(If, OptSet, T))
-     end;
-comp_ifaddrs([], T) ->
-    [{If,ktree_keys(ktree_get(If, T))} || If <- ktree_keys(T)].
-
-comp_ifaddrs_add(OptSet, [Opt|Opts]) ->
-    case ktree_is_defined(Opt, OptSet) of
-	true
-	  when element(1, Opt) =:= flags;
-	       element(1, Opt) =:= hwaddr ->
-	    comp_ifaddrs_add(OptSet, Opts);
-	_ ->
-	    comp_ifaddrs_add(ktree_insert(Opt, undefined, OptSet), Opts)
+comp_ifaddrs(IfOpts) ->
+    comp_ifaddrs(IfOpts, ktree_empty()).
+%%
+comp_ifaddrs([{If,[{flags,Flags}|Opts]}|IfOpts], IfT) ->
+    case ktree_is_defined(If, IfT) of
+        true ->
+            comp_ifaddrs(
+              IfOpts,
+              ktree_update(
+                If,
+                comp_ifaddrs_flags(Flags, Opts, ktree_get(If, IfT)),
+                IfT));
+        false ->
+            comp_ifaddrs(
+              IfOpts,
+              ktree_insert(
+                If,
+                comp_ifaddrs_flags(Flags, Opts, ktree_empty()),
+                IfT))
     end;
-comp_ifaddrs_add(OptSet, []) -> OptSet.
+comp_ifaddrs([], IfT) ->
+    comp_ifaddrs_2(ktree_keys(IfT), IfT).
+
+comp_ifaddrs_flags(Flags, Opts, FlagsT) ->
+    case ktree_is_defined(Flags, FlagsT) of
+        true ->
+            ktree_update(
+              Flags,
+              rev(Opts, ktree_get(Flags, FlagsT)),
+              FlagsT);
+        false ->
+            ktree_insert(Flags, rev(Opts), FlagsT)
+    end.
+
+comp_ifaddrs_2([If|Ifs], IfT) ->
+    FlagsT = ktree_get(If, IfT),
+    [{If,comp_ifaddrs_3(ktree_keys(FlagsT), FlagsT)}
+     | comp_ifaddrs_2(Ifs, IfT)];
+comp_ifaddrs_2([], _IfT) ->
+    [].
+%%
+comp_ifaddrs_3([Flags|FlagsL], FlagsT) ->
+    [{flags,Flags}|hwaddr_last(rev(ktree_get(Flags, FlagsT)))]
+        ++ hwaddr_last(comp_ifaddrs_3(FlagsL, FlagsT));
+comp_ifaddrs_3([], _FlagsT) ->
+    [].
+
+%% Place hwaddr last to look more like legacy emulation
+hwaddr_last(Opts) ->
+    hwaddr_last(Opts, Opts, []).
+%%
+hwaddr_last([{hwaddr,_} = Opt|Opts], L, R) ->
+    hwaddr_last(Opts, L, [Opt|R]);
+hwaddr_last([_|Opts], L, R) ->
+    hwaddr_last(Opts, L, R);
+hwaddr_last([], L, []) ->
+    L;
+hwaddr_last([], L, R) ->
+    rev(hwaddr_last(L, []), rev(R)).
+%%
+hwaddr_last([{hwaddr,_}|Opts], R) ->
+    hwaddr_last(Opts, R);
+hwaddr_last([Opt|Opts], R) ->
+    hwaddr_last(Opts, [Opt|R]);
+hwaddr_last([], R) ->
+    R.
+
 
 %% Legacy emulation of getifaddrs
 
@@ -912,21 +1068,19 @@ getifaddrs_ifget(_, []) -> [];
 getifaddrs_ifget(S, [IF|IFs]) ->
     case ifget(S, IF, [flags]) of
 	{ok,[{flags,Flags}]=FlagsVals} ->
-	    BroadOpts =
-		case member(broadcast, Flags) of
-		    true ->
-			[broadaddr,hwaddr];
-		    false ->
-			[hwaddr]
-		end,
-	    P2POpts =
-		case member(pointtopoint, Flags) of
-		    true ->
-			[dstaddr|BroadOpts];
-		    false ->
-			BroadOpts
-		end,
-	    getifaddrs_ifget(S, IFs, IF, FlagsVals, [addr,netmask|P2POpts]);
+            GetOpts =
+                case member(pointtopoint, Flags) of
+                    true ->
+                        [dstaddr,hwaddr];
+                    false ->
+                        case member(broadcast, Flags) of
+                            true ->
+                                [broadaddr,hwaddr];
+                            false ->
+                                [hwaddr]
+                        end
+                end,
+	    getifaddrs_ifget(S, IFs, IF, FlagsVals, [addr,netmask|GetOpts]);
 	_ ->
 	    getifaddrs_ifget(S, IFs, IF, [], [addr,netmask,hwaddr])
     end.
@@ -1275,6 +1429,7 @@ enc_opt(pktoptions)      -> ?INET_OPT_PKTOPTIONS;
 enc_opt(ttl)             -> ?INET_OPT_TTL;
 enc_opt(recvttl)         -> ?INET_OPT_RECVTTL;
 enc_opt(nodelay)         -> ?TCP_OPT_NODELAY;
+enc_opt(nopush)          -> ?TCP_OPT_NOPUSH;
 enc_opt(multicast_if)    -> ?UDP_OPT_MULTICAST_IF;
 enc_opt(multicast_ttl)   -> ?UDP_OPT_MULTICAST_TTL;
 enc_opt(multicast_loop)  -> ?UDP_OPT_MULTICAST_LOOP;
@@ -1336,6 +1491,7 @@ dec_opt(?INET_OPT_PRIORITY)       -> priority;
 dec_opt(?INET_OPT_TOS)            -> tos;
 dec_opt(?INET_OPT_TCLASS)         -> tclass;
 dec_opt(?TCP_OPT_NODELAY)         -> nodelay;
+dec_opt(?TCP_OPT_NOPUSH)          -> nopush;
 dec_opt(?INET_OPT_RECVTOS)        -> recvtos;
 dec_opt(?INET_OPT_RECVTCLASS)     -> recvtclass;
 dec_opt(?INET_OPT_PKTOPTIONS)     -> pktoptions;
@@ -1422,6 +1578,7 @@ type_opt_1(pktoptions)      -> opts;
 type_opt_1(ttl)             -> int;
 type_opt_1(recvttl)         -> bool;
 type_opt_1(nodelay)         -> bool;
+type_opt_1(nopush)          -> bool;
 type_opt_1(ipv6_v6only)     -> bool;
 %% multicast
 type_opt_1(multicast_ttl)   -> int;
@@ -2500,7 +2657,7 @@ get_addrs([F|Addrs]) ->
     [Addr|get_addrs(Rest)].
 
 get_addr(?INET_AF_LOCAL, [N|Addr]) ->
-    {A,Rest} = lists:split(N, Addr),
+    {A,Rest} = split(N, Addr),
     {{local,iolist_to_binary(A)},Rest};
 get_addr(?INET_AF_UNSPEC, Rest) ->
     {{unspec,<<>>},Rest};
