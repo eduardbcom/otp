@@ -388,6 +388,56 @@ if test X"$with_ets_write_concurrency_locks" != X""; then
 		      [Define to override the default number of write_concurrency locks])
 fi
 
+AC_ARG_WITH(spectre-mitigation,
+    AS_HELP_STRING([--with-spectre-mitigation={yes|incomplete}],
+                   [enable spectre mitigation, either fully or with mitigations
+                    disabled in a handful places like the interpreter])
+    AS_HELP_STRING([--without-spectre-mitigation],
+                   [build without spectre mitigation]),
+    [],[with_spectre_mitigation=no])
+
+case "$with_spectre_mitigation" in
+    no) ;;
+    yes) ;;
+    incomplete) ;;
+    *) AC_MSG_ERROR([Invalid spectre mitigation setting]) ;;
+esac
+
+i_noretpoline_attr=""
+
+if test X"$with_spectre_mitigation" != X"no"; then
+    CFLAGS="$CFLAGS -mindirect-branch=thunk"
+
+    AC_MSG_CHECKING([for spectre mitigation])
+    AC_COMPILE_IFELSE(
+        [AC_LANG_PROGRAM([],[return 0;])],
+        [AC_MSG_RESULT([yes])],
+        [AC_MSG_ERROR([no])])
+
+    if test X"$with_spectre_mitigation" = X"incomplete"; then
+        # gcc and clang support this attribute if they're recent enough. Note
+        # that we must compile with -Werror to check for actual support as they
+        # warn rather than error out on unsupported attributes.
+
+        i_noretpoline_attr='__attribute__((__indirect_branch__("keep")))'
+        i_preserve_cflags="$CFLAGS"
+        CFLAGS="$CFLAGS -Werror"
+
+        AC_MSG_CHECKING([whether spectre mitigation can be disabled on a per-function basis])
+        AC_COMPILE_IFELSE(
+            [AC_LANG_PROGRAM([$i_noretpoline_attr],[return 0;])],
+            [AC_MSG_RESULT([yes])],
+            [AC_MSG_ERROR([no])])
+
+        CFLAGS="$i_preserve_cflags"
+    fi
+fi
+
+AC_DEFINE_UNQUOTED(ERTS_NO_RETPOLINE, $i_noretpoline_attr,
+                   [Per-function attribute for disabling retpoline. This is
+                    *only* defined when --with-spectre-mitigation=incomplete
+                    and has no effects otherwise])
+
 dnl ----------------------------------------------------------------------
 dnl Checks for programs.
 dnl ----------------------------------------------------------------------
@@ -539,6 +589,17 @@ else
   WFLAGS=""
   WERRORFLAGS=""
 fi
+
+AC_MSG_CHECKING([CFLAGS for -O switch])
+case "$CFLAGS" in
+     *-O*) AC_MSG_RESULT([yes]) ;;
+     *)
+       AC_MSG_ERROR([
+  CFLAGS must contain a -O flag. If you need to edit the CFLAGS you probably
+  also want to add the default CFLAGS. The default CFLAGS are "-O2 -g".
+  If you want to build erts without any optimization, pass -O0 to CFLAGS.]) ;;
+esac
+
 dnl DEBUG_FLAGS is obsolete (I hope)
 AC_SUBST(DEBUG_FLAGS)
 AC_SUBST(DEBUG_CFLAGS)
@@ -731,11 +792,6 @@ AC_SUBST(LIBCARBON)
 
 _search_path=/bin:/usr/bin:/usr/local/bin:$PATH
 
-AC_PATH_PROG(RM, rm, false, $_search_path)
-if test "$ac_cv_path_RM" = false; then
-  AC_MSG_ERROR([No 'rm' command found])
-fi
-
 AC_PATH_PROG(MKDIR, mkdir, false, $_search_path)
 if test "$ac_cv_path_MKDIR" = false; then
   AC_MSG_ERROR([No 'mkdir' command found])
@@ -750,9 +806,9 @@ _search_path=
 
 
 # Remove old configuration information.
-# Next line should be placed after AC_PATH_PROG(RM, ...), but before
-# first output to CONN_INFO. So this is just the right place.
-$RM -f "$ERL_TOP/erts/CONF_INFO"
+# Next line should be before first output to CONN_INFO. So this is
+# just the right place.
+rm -f "$ERL_TOP/erts/CONF_INFO"
 
 dnl Check if we should/can build a sharing-preserving emulator
 AC_MSG_CHECKING(if we are building a sharing-preserving emulator)
@@ -790,7 +846,7 @@ fi
 
 ## Delete previous failed configure results
 if test -f doc/CONF_INFO; then
-   $RM doc/CONF_INFO
+   rm -f doc/CONF_INFO
 fi
 
 AC_CHECK_PROGS(XSLTPROC, xsltproc)
@@ -3156,7 +3212,11 @@ AC_TRY_RUN([
 ],
 erl_code_model_small=yes,
 erl_code_model_small=no,
-erl_code_model_small=no)
+[case X$erl_xcomp_code_model_small in
+      X) erl_code_model_small=no;;
+      Xyes|Xno) erl_code_model_small=$erl_xcomp_code_model_small;;
+      *) AC_MSG_ERROR([Bad erl_xcomp_code_model_small value: $erl_xcomp_code_model_small]);;
+ esac])
 AC_MSG_RESULT([$erl_code_model_small])
 LDFLAGS="$saved_LDFLAGS"
 case $erl_code_model_small in
@@ -3223,14 +3283,14 @@ if test "$enable_dtrace_test" = "yes" ; then
 		AC_MSG_CHECKING([for 2-stage DTrace precompilation])
                 AC_TRY_COMPILE([ #include "foo-dtrace.h" ],
                     [ERLANG_DIST_PORT_BUSY_ENABLED();],
-		    [$RM -f $DTRACE_2STEP_TEST
+		    [rm -f $DTRACE_2STEP_TEST
 		     dtrace -G $DTRACE_CPP $DTRACE_BITS_FLAG -Iemulator/beam -o $DTRACE_2STEP_TEST -s emulator/beam/erlang_dtrace.d conftest.$OBJEXT 2>&AS_MESSAGE_LOG_FD
                      if test -f $DTRACE_2STEP_TEST; then
-			$RM $DTRACE_2STEP_TEST
+			rm -f $DTRACE_2STEP_TEST
                         DTRACE_ENABLED_2STEP=yes
 		     fi],
                     [])
-		$RM -f foo-dtrace.h
+		rm -f foo-dtrace.h
 		AS_IF([test "x$DTRACE_ENABLED_2STEP" = "xyes"],
 		      [AC_MSG_RESULT([yes])],
                       [AC_MSG_RESULT([no])])
@@ -3434,7 +3494,7 @@ ssl_done=yes # Default only one run
 
 # Remove all SKIP files from previous runs
 for a in ssl crypto ssh; do
-  $RM -f $ERL_TOP/lib/$a/SKIP
+  rm -f $ERL_TOP/lib/$a/SKIP
 done
 
 SSL_DYNAMIC_ONLY=$enable_dynamic_ssl
@@ -4055,7 +4115,7 @@ need_java="jinterface ic/java_src"
 
 # Remove all SKIP files from previous runs
 for a in $need_java ; do
-  $RM -f $ERL_TOP/lib/$a/SKIP
+  rm -f $ERL_TOP/lib/$a/SKIP
 done
 
 if test "X$with_javac" = "Xno"; then
@@ -4106,7 +4166,7 @@ dnl this deliberately does not believe that 'gcc' is a C++ compiler
 AC_CHECK_TOOLS(CXX, [$CCC c++ g++ CC cxx cc++ cl], false)
 
 # Remove SKIP file from previous run
-$RM -f $ERL_TOP/lib/orber/SKIP
+rm -f $ERL_TOP/lib/orber/SKIP
 
 if test "$CXX" = false; then
   echo "No C++ compiler found" > $ERL_TOP/lib/orber/SKIP
@@ -4261,12 +4321,13 @@ AC_CONFIG_FILES([../make/make_emakefile:../make/make_emakefile.in],
 dnl
 dnl The ones below should be moved to their respective lib
 dnl
-dnl  ../lib/ssl/c_src/$host/Makefile:../lib/ssl/c_src/Makefile.in
 AC_CONFIG_FILES([
   ../lib/os_mon/c_src/$host/Makefile:../lib/os_mon/c_src/Makefile.in
   ../lib/crypto/c_src/$host/Makefile:../lib/crypto/c_src/Makefile.in
   ../lib/runtime_tools/c_src/$host/Makefile:../lib/runtime_tools/c_src/Makefile.in
   ../lib/tools/c_src/$host/Makefile:../lib/tools/c_src/Makefile.in
   ])
+
+AC_CONFIG_FILES([../make/install_dir_data.sh:../make/install_dir_data.sh.in], [chmod +x ../make/install_dir_data.sh])
 
 AC_OUTPUT

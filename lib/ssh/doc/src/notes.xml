@@ -30,6 +30,101 @@
     <file>notes.xml</file>
   </header>
 
+<section><title>Ssh 4.7.4</title>
+
+    <section><title>Fixed Bugs and Malfunctions</title>
+      <list>
+        <item>
+          <p>
+	    SSH sftp daemon now accepts an SSH_FXP_STAT message
+	    encoded according to the wrong sftp version. Some clients
+	    sends such messages.</p>
+          <p>
+	    Own Id: OTP-15498 Aux Id: ERL-822, PR-2077 </p>
+        </item>
+      </list>
+    </section>
+
+</section>
+
+<section><title>Ssh 4.7.3</title>
+
+    <section><title>Fixed Bugs and Malfunctions</title>
+      <list>
+        <item>
+          <p>
+	    Fixed port leakage if a ssh:daemon call failed.</p>
+          <p>
+	    Own Id: OTP-15397 Aux Id: ERL-801 </p>
+        </item>
+      </list>
+    </section>
+
+</section>
+
+<section><title>Ssh 4.7.2</title>
+
+    <section><title>Fixed Bugs and Malfunctions</title>
+      <list>
+        <item>
+          <p>
+	    Incompatibility with newer OpenSSH fixed. Previously
+	    versions 7.8 and later could cause Erlang SSH to exit.</p>
+          <p>
+	    Own Id: OTP-15413</p>
+        </item>
+        <item>
+          <p>
+	    The '<c>exec</c>' option for ssh daemons had wrong format
+	    in the documentation.</p>
+          <p>
+	    Own Id: OTP-15416</p>
+        </item>
+      </list>
+    </section>
+
+
+    <section><title>Improvements and New Features</title>
+      <list>
+        <item>
+          <p>
+	    Added public key methods ssh-ed25519 and ssh-ed448.</p>
+          <p>
+	    Requires OpenSSL 1.1.1 or higher as cryptolib under the
+	    OTP application <c>crypto</c>.</p>
+          <p>
+	    Own Id: OTP-15094 Aux Id: OTP-15419 </p>
+        </item>
+        <item>
+          <p>
+	    The SSH property tests are now adapted to the PropEr
+	    testing tool.</p>
+          <p>
+	    Own Id: OTP-15312</p>
+        </item>
+        <item>
+          <p>
+	    The term "user" was not documented in the SSH app. A new
+	    chapter with terminology is added to the User's Manual
+	    where the term "user" is defined.</p>
+          <p>
+	    A reference manual page about the module <c>ssh_file</c>
+	    is also added. This is the default callback module for
+	    user's keys, host keys etc.</p>
+          <p>
+	    Own Id: OTP-15314</p>
+        </item>
+        <item>
+          <p>
+	    Host and user key checking is made more robust.</p>
+          <p>
+	    Own Id: OTP-15424</p>
+        </item>
+      </list>
+    </section>
+
+</section>
+
 <section><title>Ssh 4.7.1</title>
 
     <section><title>Improvements and New Features</title>
@@ -228,6 +323,37 @@
         </item>
       </list>
     </section>
+</section>
+
+<section><title>Ssh 4.6.9.3</title>
+
+    <section><title>Fixed Bugs and Malfunctions</title>
+      <list>
+        <item>
+          <p>
+	    Fixed port leakage if a ssh:daemon call failed.</p>
+          <p>
+	    Own Id: OTP-15397 Aux Id: ERL-801 </p>
+        </item>
+      </list>
+    </section>
+
+</section>
+
+<section><title>Ssh 4.6.9.2</title>
+
+    <section><title>Fixed Bugs and Malfunctions</title>
+      <list>
+        <item>
+          <p>
+	    Incompatibility with newer OpenSSH fixed. Previously
+	    versions 7.8 and later could cause Erlang SSH to exit.</p>
+          <p>
+	    Own Id: OTP-15413</p>
+        </item>
+      </list>
+    </section>
+
 </section>
 
 <section><title>Ssh 4.6.9.1</title>
@@ -3869,4 +3995,3 @@
 
   </section>
 </chapter>
-

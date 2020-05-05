@@ -68,6 +68,8 @@
              logger_formatter,
              logger_h_common,
              logger_handler_watcher,
+             logger_olp,
+             logger_proxy,
              logger_server,
              logger_simple_h,
              logger_std_h,
@@ -146,6 +148,6 @@
          {logger_sasl_compatible, false}
         ]},
   {mod, {kernel, []}},
-  {runtime_dependencies, ["erts-10.1", "stdlib-3.5", "sasl-3.0"]}
+  {runtime_dependencies, ["erts-10.2.5", "stdlib-3.5", "sasl-3.0"]}
  ]
 }.

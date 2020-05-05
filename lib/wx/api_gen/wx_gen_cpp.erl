@@ -995,8 +995,13 @@ build_ret_types(Type,Ps) ->
 	   end,
     lists:foldl(Calc, Free, Ps).
 
-build_ret(Name,_,#type{base={class,Class},single=true}) ->
-    w(" rt.addRef(getRef((void *)~s,memenv), \"~s\");~n",[Name,Class]);
+build_ret(Name,_D,#type{base={class,Class},single=true}=_T) ->
+    case Class of
+        "wxGraphicsContext" ->
+            w(" rt.addRef(getRef((void *)~s,memenv,8), \"~s\");~n",[Name,Class]);
+        _ ->
+            w(" rt.addRef(getRef((void *)~s,memenv), \"~s\");~n",[Name,Class])
+    end;
 build_ret(Name,_,#type{name="wxTreeItemId",single=true}) ->
     w(" rt.add((wxUIntPtr *) ~s.m_pItem);~n",[Name]);
 build_ret(Name,_,#type{name="wxTreeItemIdValue",single=true}) ->
@@ -1160,6 +1165,7 @@ gen_macros() ->
     w("#include <wx/fontdlg.h>~n"),
     w("#include <wx/progdlg.h>~n"),
     w("#include <wx/printdlg.h>~n"),
+    w("#include <wx/display.h>~n"),
     w("#include <wx/dcbuffer.h>~n"),
     w("#include <wx/dcmirror.h>~n"),
     w("#include <wx/glcanvas.h>~n"),
@@ -1171,6 +1177,7 @@ gen_macros() ->
     w("#include <wx/sashwin.h>~n"),
     w("#include <wx/laywin.h>~n"),
     w("#include <wx/graphics.h>~n"),
+    w("#include <wx/dcgraph.h>~n"),
     w("#include <wx/aui/aui.h>~n"),
     w("#include <wx/datectrl.h>~n"),
     w("#include <wx/filepicker.h>~n"),
@@ -1325,8 +1332,10 @@ encode_events(Evs) ->
     w(" } else {~n"),
     w("   send_res =  rt.send();~n"),
     w("   if(cb->skip) event->Skip();~n"),
-    #class{id=MouseId} = lists:keyfind("wxMouseEvent", #class.name, Evs),
-    w("   if(app->recurse_level < 1 && Etype->cID != ~p) {~n", [MouseId]),
+    #class{id=SizeId} = lists:keyfind("wxSizeEvent", #class.name, Evs),
+    #class{id=MoveId} = lists:keyfind("wxMoveEvent", #class.name, Evs),
+    w("   if(app->recurse_level < 1 && (Etype->cID == ~w || Etype->cID == ~w)) {~n",
+      [SizeId, MoveId]),
     w("     app->recurse_level++;~n"),
     w("     app->dispatch_cmds();~n"),
     w("     app->recurse_level--;~n"),

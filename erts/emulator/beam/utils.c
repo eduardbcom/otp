@@ -1946,7 +1946,7 @@ do_allocate_logger_message(Eterm gleader, ErtsMonotonicTime *ts, Eterm *pid,
     else
         sz += MAP4_SZ /* metadata map w gl w pid*/;
 
-    *ts = ERTS_MONOTONIC_TO_USEC(erts_get_monotonic_time(NULL) + erts_get_time_offset());
+    *ts = ERTS_MONOTONIC_TO_USEC(erts_os_system_time());
     erts_bld_sint64(NULL, &sz, *ts);
 
     *bp = new_message_buffer(sz);
@@ -2615,27 +2615,6 @@ not_equal:
 }
 
 
-/* 
- * Lexically compare two strings of bytes (string s1 length l1 and s2 l2).
- *
- *	s1 < s2	return -1
- *	s1 = s2	return  0
- *	s1 > s2 return +1
- */
-static int cmpbytes(byte *s1, int l1, byte *s2, int l2)
-{
-    int i;
-    i = 0;
-    while((i < l1) && (i < l2)) {
-	if (s1[i] < s2[i]) return(-1);
-	if (s1[i] > s2[i]) return(1);
-	i++;
-    }
-    if (l1 < l2) return(-1);
-    if (l1 > l2) return(1);
-    return(0);
-}
-
 
 /*
  * Compare objects.
@@ -2649,20 +2628,6 @@ static int cmpbytes(byte *s1, int l1, byte *s2, int l2)
  *
  */
 
-
-#define float_comp(x,y)    (((x)<(y)) ? -1 : (((x)==(y)) ? 0 : 1))
-
-int erts_cmp_atoms(Eterm a, Eterm b)
-{
-    Atom *aa = atom_tab(atom_val(a));
-    Atom *bb = atom_tab(atom_val(b));
-    int diff = aa->ord0 - bb->ord0;
-    if (diff)
-	return diff;
-    return cmpbytes(aa->name+3, aa->len-3,
-		    bb->name+3, bb->len-3);
-}
-
 /* cmp(Eterm a, Eterm b)
  *  For compatibility with HiPE - arith-based compare.
  */
@@ -2672,22 +2637,6 @@ Sint cmp(Eterm a, Eterm b)
 }
 
 Sint erts_cmp_compound(Eterm a, Eterm b, int exact, int eq_only);
-
-Sint erts_cmp(Eterm a, Eterm b, int exact, int eq_only)
-{
-    if (is_atom(a) && is_atom(b)) {
-        return erts_cmp_atoms(a, b);
-    } else if (is_both_small(a, b)) {
-        return (signed_val(a) - signed_val(b));
-    } else if (is_float(a) && is_float(b)) {
-        FloatDef af, bf;
-        GET_DOUBLE(a, af);
-        GET_DOUBLE(b, bf);
-        return float_comp(af.fd, bf.fd);
-    }
-    return erts_cmp_compound(a,b,exact,eq_only);
-}
-
 
 /* erts_cmp(Eterm a, Eterm b, int exact)
  * exact = 1 -> term-based compare
@@ -2985,7 +2934,7 @@ tailrecur_ne:
 
 		    GET_DOUBLE(a, af);
 		    GET_DOUBLE(b, bf);
-		    ON_CMP_GOTO(float_comp(af.fd, bf.fd));
+		    ON_CMP_GOTO(erts_float_comp(af.fd, bf.fd));
 		}
 	    case (_TAG_HEADER_POS_BIG >> _TAG_PRIMARY_SIZE):
 	    case (_TAG_HEADER_NEG_BIG >> _TAG_PRIMARY_SIZE):
@@ -3022,10 +2971,7 @@ tailrecur_ne:
 		    ErlFunThing* f2 = (ErlFunThing *) fun_val(b);
 		    Sint diff;
 
-		    diff = cmpbytes(atom_tab(atom_val(f1->fe->module))->name,
-				    atom_tab(atom_val(f1->fe->module))->len,
-				    atom_tab(atom_val(f2->fe->module))->name,
-				    atom_tab(atom_val(f2->fe->module))->len);
+                    diff = erts_cmp_atoms((f1->fe)->module, (f2->fe)->module);
 		    if (diff != 0) {
 			RETURN_NEQ(diff);
 		    }
@@ -3219,7 +3165,7 @@ tailrecur_ne:
 	    if (f2.fd < MAX_LOSSLESS_FLOAT && f2.fd > MIN_LOSSLESS_FLOAT) {
 		/* Float is within the no loss limit */
 		f1.fd = signed_val(aw);
-		j = float_comp(f1.fd, f2.fd);
+		j = erts_float_comp(f1.fd, f2.fd);
 	    }
 #if ERTS_SIZEOF_ETERM == 8
 	    else if (f2.fd > (double) (MAX_SMALL + 1)) {
@@ -3266,7 +3212,7 @@ tailrecur_ne:
 		if (big_to_double(aw, &f1.fd) < 0) {
 		    j = big_sign(aw) ? -1 : 1;
 		} else {
-		    j = float_comp(f1.fd, f2.fd);
+		    j = erts_float_comp(f1.fd, f2.fd);
 		}
 	    } else {
 		big = double_to_big(f2.fd, big_buf, sizeof(big_buf)/sizeof(Eterm));
@@ -3282,7 +3228,7 @@ tailrecur_ne:
 	    if (f1.fd < MAX_LOSSLESS_FLOAT && f1.fd > MIN_LOSSLESS_FLOAT) {
 		/* Float is within the no loss limit */
 		f2.fd = signed_val(bw);
-		j = float_comp(f1.fd, f2.fd);
+		j = erts_float_comp(f1.fd, f2.fd);
 	    }
 #if ERTS_SIZEOF_ETERM == 8
 	    else if (f1.fd > (double) (MAX_SMALL + 1)) {
@@ -3735,30 +3681,47 @@ erts_unicode_list_to_buf_len(Eterm list)
     }
 }
 
-/*
-** Convert an integer to a byte list
-** return pointer to converted stuff (need not to be at start of buf!)
-*/
-char* Sint_to_buf(Sint n, struct Sint_buf *buf)
+/* Prints an integer in the given base, returning the number of digits printed.
+ *
+ * (*buf) is a pointer to the buffer, and is set to the start of the string
+ * when returning. */
+int Sint_to_buf(Sint n, int base, char **buf, size_t buf_size)
 {
-    char* p = &buf->s[sizeof(buf->s)-1];
-    int sign = 0;
+    char *p = &(*buf)[buf_size - 1];
+    int sign = 0, size = 0;
 
-    *p-- = '\0'; /* null terminate */
-    if (n == 0)
-	*p-- = '0';
-    else if (n < 0) {
-	sign = 1;
-	n = -n;
+    ASSERT(base >= 2 && base <= 36);
+
+    if (n == 0) {
+        *p-- = '0';
+        size++;
+    } else if (n < 0) {
+        sign = 1;
+        n = -n;
     }
 
     while (n != 0) {
-	*p-- = (n % 10) + '0';
-	n /= 10;
+        int digit = n % base;
+
+        if (digit < 10) {
+            *p-- = '0' + digit;
+        } else {
+            *p-- = 'A' + (digit - 10);
+        }
+
+        size++;
+
+        n /= base;
     }
-    if (sign)
-	*p-- = '-';
-    return p+1;
+
+    if (sign) {
+        *p-- = '-';
+        size++;
+    }
+
+    *buf = p + 1;
+
+    return size;
 }
 
 /* Build a list of integers in some safe memory area
@@ -4825,58 +4788,3 @@ erts_ptr_id(void *ptr)
     return ptr;
 }
 
-#ifdef DEBUG
-/*
- * Handy functions when using a debugger - don't use in the code!
- */
-
-void upp(byte *buf, size_t sz)
-{
-    bin_write(ERTS_PRINT_STDERR, NULL, buf, sz);
-}
-
-void pat(Eterm atom)
-{
-    upp(atom_tab(atom_val(atom))->name,
-	atom_tab(atom_val(atom))->len);
-}
-
-
-void pinfo()
-{
-    process_info(ERTS_PRINT_STDOUT, NULL);
-}
-
-
-void pp(p)
-Process *p;
-{
-    if(p)
-	print_process_info(ERTS_PRINT_STDERR, NULL, p);
-}
-
-void ppi(Eterm pid)
-{
-    pp(erts_proc_lookup(pid));
-}
-
-void td(Eterm x)
-{
-    erts_fprintf(stderr, "%T\n", x);
-}
-
-void
-ps(Process* p, Eterm* stop)
-{
-    Eterm* sp = STACK_START(p) - 1;
-
-    if (stop <= STACK_END(p)) {
-        stop = STACK_END(p) + 1;
-    }
-
-    while(sp >= stop) {
-	erts_printf("%p: %.75T\n", sp, *sp);
-	sp--;
-    }
-}
-#endif

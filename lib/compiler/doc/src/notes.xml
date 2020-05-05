@@ -32,6 +32,145 @@
   <p>This document describes the changes made to the Compiler
     application.</p>
 
+<section><title>Compiler 7.3.2</title>
+
+    <section><title>Fixed Bugs and Malfunctions</title>
+      <list>
+        <item>
+	    <p>An expression such as <c>(A / B) band 16#ff</c> would
+	    crash the compiler.</p>
+          <p>
+	    Own Id: OTP-15518 Aux Id: ERL-829 </p>
+        </item>
+        <item>
+	    <p>There could be an incorrect warning when the
+	    <c>tuple_calls</c> option was given. The generated code
+	    would be correct. Here is an example of code that would
+	    trigger the warning:</p>
+	    <p><c>(list_to_atom("prefix_" ++
+	    atom_to_list(suffix))):doit(X)</c>.</p>
+          <p>
+	    Own Id: OTP-15552 Aux Id: ERL-838 </p>
+        </item>
+        <item>
+	    <p>Optimize (again) Dialyzer's handling of
+	    left-associative use of <c>andalso</c> and <c>orelse</c>
+	    in guards.</p>
+          <p>
+	    Own Id: OTP-15577 Aux Id: ERL-851, PR-2141, PR-1944 </p>
+        </item>
+      </list>
+    </section>
+
+</section>
+
+<section><title>Compiler 7.3.1</title>
+
+    <section><title>Fixed Bugs and Malfunctions</title>
+      <list>
+        <item>
+	    <p>An optimization that avoided allocation of a stack
+	    frame for some <c>case</c> expressions was introduced in
+	    OTP 21. (ERL-504/OTP-14808) It turns out that in rare
+	    circumstances, this optimization is not safe. Therefore,
+	    this optimization has been disabled.</p>
+	    <p>A similar optimization will be included in OTP 22 in a
+	    safe way.</p>
+          <p>
+	    Own Id: OTP-15501 Aux Id: ERL-807, ERL-514, OTP-14808 </p>
+        </item>
+      </list>
+    </section>
+
+</section>
+
+<section><title>Compiler 7.3</title>
+
+    <section><title>Fixed Bugs and Malfunctions</title>
+      <list>
+        <item>
+	    <p>Fixed a rare internal consistency failure caused by a
+	    bug in the <c>beam_jump</c> pass. (Thanks to Simon
+	    Cornish for reporting this bug.)</p>
+          <p>
+	    Own Id: OTP-15400 Aux Id: ERL-759 </p>
+        </item>
+        <item>
+	    <p>The compiler could fail with an internal consistency
+	    check failure when compiling code that used the
+	    <c>is_function/2</c> BIF.</p>
+          <p>
+	    Own Id: OTP-15435 Aux Id: ERL-778 </p>
+        </item>
+        <item>
+	    <p>When an external fun was used, warnings for unused
+	    variables could be suppressed.</p>
+          <p>
+	    Own Id: OTP-15437 Aux Id: ERL-762 </p>
+        </item>
+        <item>
+	    <p>The compiler would crash when compiling an
+	    <c>after</c> block that called <c>erlang:raise/3</c> like
+	    this: <c>erlang:raise(Class, Stacktrace,
+	    Stacktrace)</c></p>
+          <p>
+	    Own Id: OTP-15481</p>
+        </item>
+      </list>
+    </section>
+
+
+    <section><title>Improvements and New Features</title>
+      <list>
+        <item>
+	    <p>When specified, the <c>+{source,Name}</c> option will
+	    now override the actual file name in stack traces,
+	    instead of only affecting the return value of
+	    <c>Mod:module_info()</c>.</p>
+	    <p>The <c>+deterministic</c> flag will also affect stack
+	    traces now, omitting all path information except the file
+	    name, fixing a long-standing issue where deterministic
+	    builds required deterministic paths.</p>
+          <p>
+	    Own Id: OTP-15245 Aux Id: ERL-706 </p>
+        </item>
+      </list>
+    </section>
+
+</section>
+
+<section><title>Compiler 7.2.7</title>
+
+    <section><title>Fixed Bugs and Malfunctions</title>
+      <list>
+        <item>
+	    <p>Fixed a bug where incorrect code was generated
+	    following a binary match guard.</p>
+          <p>
+	    Own Id: OTP-15353 Aux Id: ERL-753 </p>
+        </item>
+      </list>
+    </section>
+
+</section>
+
+<section><title>Compiler 7.2.6</title>
+
+    <section><title>Fixed Bugs and Malfunctions</title>
+      <list>
+        <item>
+	    <p>In rare circumstances, the matched out tail of a
+	    binary could be the entire original binary. (There was
+	    partial correction to this problem in version 7.2.5 of
+	    the compiler application.)</p>
+          <p>
+	    Own Id: OTP-15335 Aux Id: ERL-689, OTP-15219 </p>
+        </item>
+      </list>
+    </section>
+
+</section>
+
 <section><title>Compiler 7.2.5</title>
 
     <section><title>Fixed Bugs and Malfunctions</title>

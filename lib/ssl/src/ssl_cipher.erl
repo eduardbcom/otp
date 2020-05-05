@@ -1,7 +1,7 @@
 %
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2007-2018. All Rights Reserved.
+%% Copyright Ericsson AB 2007-2019. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -34,19 +34,21 @@
 -include_lib("public_key/include/public_key.hrl").
 
 -export([security_parameters/2, security_parameters/3, 
-	 cipher_init/3, decipher/6, cipher/5, decipher_aead/6, cipher_aead/6,
+	 cipher_init/3, nonce_seed/2, decipher/6, cipher/5, aead_encrypt/5, aead_decrypt/6,
 	 suites/1, all_suites/1,  crypto_support_filters/0,
 	 chacha_suites/1, anonymous_suites/1, psk_suites/1, psk_suites_anon/1, 
          srp_suites/0, srp_suites_anon/0,
 	 rc4_suites/1, des_suites/1, rsa_suites/1, 
          filter/3, filter_suites/1, filter_suites/2,
 	 hash_algorithm/1, sign_algorithm/1, is_acceptable_hash/2, is_fallback/1,
-	 random_bytes/1, calc_mac_hash/4,
+	 random_bytes/1, calc_mac_hash/4, calc_mac_hash/6,
          is_stream_ciphersuite/1]).
 
 -compile(inline).
 
 -type cipher_enum()        :: integer().
+
+-export_type([cipher_enum/0]).
 
 %%--------------------------------------------------------------------
 -spec security_parameters(ssl_cipher_format:cipher_suite(), #security_parameters{}) ->
@@ -91,9 +93,15 @@ cipher_init(?RC4, IV, Key) ->
     #cipher_state{iv = IV, key = Key, state = State};
 cipher_init(?AES_GCM, IV, Key) ->
     <<Nonce:64>> = random_bytes(8),
-    #cipher_state{iv = IV, key = Key, nonce = Nonce};
+    #cipher_state{iv = IV, key = Key, nonce = Nonce, tag_len = 16};
+cipher_init(?CHACHA20_POLY1305, IV, Key) ->
+    #cipher_state{iv = IV, key = Key, tag_len = 16};
 cipher_init(_BCA, IV, Key) ->
-    #cipher_state{iv = IV, key = Key}.
+    %% Initialize random IV cache, not used for aead ciphers
+    #cipher_state{iv = IV, key = Key, state = <<>>}.
+
+nonce_seed(Seed, CipherState) ->
+    CipherState#cipher_state{nonce = Seed}.
 
 %%--------------------------------------------------------------------
 -spec cipher(cipher_enum(), #cipher_state{}, binary(), iodata(), ssl_record:ssl_version()) ->
@@ -105,12 +113,11 @@ cipher_init(_BCA, IV, Key) ->
 %% data is calculated and the data plus the HMAC is ecncrypted.
 %%-------------------------------------------------------------------
 cipher(?NULL, CipherState, <<>>, Fragment, _Version) ->
-    GenStreamCipherList = [Fragment, <<>>],
-    {GenStreamCipherList, CipherState};
+    {iolist_to_binary(Fragment), CipherState};
 cipher(?RC4, CipherState = #cipher_state{state = State0}, Mac, Fragment, _Version) ->
     GenStreamCipherList = [Fragment, Mac],
     {State1, T} = crypto:stream_encrypt(State0, GenStreamCipherList),
-    {T, CipherState#cipher_state{state = State1}};
+    {iolist_to_binary(T), CipherState#cipher_state{state = State1}};
 cipher(?DES, CipherState, Mac, Fragment, Version) ->
     block_cipher(fun(Key, IV, T) ->
 			 crypto:block_encrypt(des_cbc, Key, IV, T)
@@ -126,37 +133,20 @@ cipher(?AES_CBC, CipherState, Mac, Fragment, Version) ->
 			 crypto:block_encrypt(aes_cbc256, Key, IV, T)
 		 end, block_size(aes_128_cbc), CipherState, Mac, Fragment, Version).
 
-%%--------------------------------------------------------------------
--spec cipher_aead(cipher_enum(), #cipher_state{}, integer(), binary(), iodata(), ssl_record:ssl_version()) ->
-		    {binary(), #cipher_state{}}.
-%%
-%% Description: Encrypts the data and protects associated data (AAD) using chipher
-%% described by cipher_enum() and updating the cipher state
-%% Use for suites that use authenticated encryption with associated data (AEAD)
-%%-------------------------------------------------------------------
-cipher_aead(?AES_GCM, CipherState, SeqNo, AAD, Fragment, Version) ->
-    aead_cipher(aes_gcm, CipherState, SeqNo, AAD, Fragment, Version);
-cipher_aead(?CHACHA20_POLY1305, CipherState, SeqNo, AAD, Fragment, Version) ->
-    aead_cipher(chacha20_poly1305, CipherState, SeqNo, AAD, Fragment, Version).
+aead_encrypt(Type, Key, Nonce, Fragment, AdditionalData) ->
+    crypto:block_encrypt(aead_type(Type), Key, Nonce, {AdditionalData, Fragment}).
 
-aead_cipher(chacha20_poly1305, #cipher_state{key=Key} = CipherState, SeqNo, AAD0, Fragment, _Version) ->
-    CipherLen = erlang:iolist_size(Fragment),
-    AAD = <<AAD0/binary, ?UINT16(CipherLen)>>,
-    Nonce = ?uint64(SeqNo),
-    {Content, CipherTag} = crypto:block_encrypt(chacha20_poly1305, Key, Nonce, {AAD, Fragment}),
-    {<<Content/binary, CipherTag/binary>>, CipherState};
-aead_cipher(Type, #cipher_state{key=Key, iv = IV0, nonce = Nonce} = CipherState, _SeqNo, AAD0, Fragment, _Version) ->
-    CipherLen = erlang:iolist_size(Fragment),
-    AAD = <<AAD0/binary, ?UINT16(CipherLen)>>,
-    <<Salt:4/bytes, _/binary>> = IV0,
-    IV = <<Salt/binary, Nonce:64/integer>>,
-    {Content, CipherTag} = crypto:block_encrypt(Type, Key, IV, {AAD, Fragment}),
-    {<<Nonce:64/integer, Content/binary, CipherTag/binary>>, CipherState#cipher_state{nonce = Nonce + 1}}.
+aead_decrypt(Type, Key, Nonce, CipherText, CipherTag, AdditionalData) ->
+    crypto:block_decrypt(aead_type(Type), Key, Nonce, {AdditionalData, CipherText, CipherTag}).
+
+aead_type(?AES_GCM) ->
+    aes_gcm;
+aead_type(?CHACHA20_POLY1305) ->
+    chacha20_poly1305.
 
 build_cipher_block(BlockSz, Mac, Fragment) ->
     TotSz = byte_size(Mac) + erlang:iolist_size(Fragment) + 1,
-    {PaddingLength, Padding} = get_padding(TotSz, BlockSz),
-    [Fragment, Mac, PaddingLength, Padding].
+    [Fragment, Mac, padding_with_len(TotSz, BlockSz)].
 
 block_cipher(Fun, BlockSz, #cipher_state{key=Key, iv=IV} = CS0,
 	     Mac, Fragment, {3, N})
@@ -166,14 +156,21 @@ block_cipher(Fun, BlockSz, #cipher_state{key=Key, iv=IV} = CS0,
     NextIV = next_iv(T, IV),
     {T, CS0#cipher_state{iv=NextIV}};
 
-block_cipher(Fun, BlockSz, #cipher_state{key=Key, iv=IV} = CS0,
+block_cipher(Fun, BlockSz, #cipher_state{key=Key, iv=IV, state = IV_Cache0} = CS0,
 	     Mac, Fragment, {3, N})
   when N == 2; N == 3 ->
-    NextIV = random_iv(IV),
+    IV_Size = byte_size(IV),
+    <<NextIV:IV_Size/binary, IV_Cache/binary>> =
+        case IV_Cache0 of
+            <<>> ->
+                random_bytes(IV_Size bsl 5); % 32 IVs
+            _ ->
+                IV_Cache0
+        end,
     L0 = build_cipher_block(BlockSz, Mac, Fragment),
     L = [NextIV|L0],
     T = Fun(Key, IV, L),
-    {T, CS0#cipher_state{iv=NextIV}}.
+    {T, CS0#cipher_state{iv=NextIV, state = IV_Cache}}.
 
 %%--------------------------------------------------------------------
 -spec decipher(cipher_enum(), integer(), #cipher_state{}, binary(), 
@@ -218,19 +215,6 @@ decipher(?AES_CBC, HashSz, CipherState, Fragment, Version, PaddingCheck) ->
 			   crypto:block_decrypt(aes_cbc256, Key, IV, T)
 		   end, CipherState, HashSz, Fragment, Version, PaddingCheck).
 
-%%--------------------------------------------------------------------
--spec decipher_aead(cipher_enum(),  #cipher_state{}, integer(), binary(), binary(), ssl_record:ssl_version()) ->
-			   {binary(), #cipher_state{}} | #alert{}.
-%%
-%% Description: Decrypts the data and checks the associated data (AAD) MAC using
-%% cipher described by cipher_enum() and updating the cipher state.
-%% Use for suites that use authenticated encryption with associated data (AEAD)
-%%-------------------------------------------------------------------
-decipher_aead(?AES_GCM, CipherState, SeqNo, AAD, Fragment, Version) ->
-    aead_decipher(aes_gcm, CipherState, SeqNo, AAD, Fragment, Version);
-decipher_aead(?CHACHA20_POLY1305, CipherState, SeqNo, AAD, Fragment, Version) ->
-    aead_decipher(chacha20_poly1305, CipherState, SeqNo, AAD, Fragment, Version).
-
 block_decipher(Fun, #cipher_state{key=Key, iv=IV} = CipherState0, 
 	       HashSz, Fragment, Version, PaddingCheck) ->
     try 
@@ -258,34 +242,6 @@ block_decipher(Fun, #cipher_state{key=Key, iv=IV} = CipherState0,
 	    %% alerts may permit certain attacks against CBC mode as used in
 	    %% TLS [CBCATT].  It is preferable to uniformly use the
 	    %% bad_record_mac alert to hide the specific type of the error."
-            ?ALERT_REC(?FATAL, ?BAD_RECORD_MAC, decryption_failed)
-    end.
-
-aead_ciphertext_to_state(chacha20_poly1305, SeqNo, _IV, AAD0, Fragment, _Version) ->
-    CipherLen = size(Fragment) - 16,
-    <<CipherText:CipherLen/bytes, CipherTag:16/bytes>> = Fragment,
-    AAD = <<AAD0/binary, ?UINT16(CipherLen)>>,
-    Nonce = ?uint64(SeqNo),
-    {Nonce, AAD, CipherText, CipherTag};
-aead_ciphertext_to_state(_, _SeqNo, <<Salt:4/bytes, _/binary>>, AAD0, Fragment, _Version) ->
-    CipherLen = size(Fragment) - 24,
-    <<ExplicitNonce:8/bytes, CipherText:CipherLen/bytes,  CipherTag:16/bytes>> = Fragment,
-    AAD = <<AAD0/binary, ?UINT16(CipherLen)>>,
-    Nonce = <<Salt/binary, ExplicitNonce/binary>>,
-    {Nonce, AAD, CipherText, CipherTag}.
-
-aead_decipher(Type, #cipher_state{key = Key, iv = IV} = CipherState,
-	      SeqNo, AAD0, Fragment, Version) ->
-    try
-	{Nonce, AAD, CipherText, CipherTag} = aead_ciphertext_to_state(Type, SeqNo, IV, AAD0, Fragment, Version),
-	case crypto:block_decrypt(Type, Key, Nonce, {AAD, CipherText, CipherTag}) of
-	    Content when is_binary(Content) ->
-		{Content, CipherState};
-	    _ ->
-                ?ALERT_REC(?FATAL, ?BAD_RECORD_MAC, decryption_failed)
-	end
-    catch
-	_:_ ->
             ?ALERT_REC(?FATAL, ?BAD_RECORD_MAC, decryption_failed)
     end.
 
@@ -531,8 +487,8 @@ filter(DerCert, Ciphers0, Version) ->
     filter_suites_signature(Sign, Ciphers, Version).
 
 %%--------------------------------------------------------------------
--spec filter_suites([ssl_cipher_format:erl_cipher_suite()] | [ssl_cipher_format:cipher_suite()], map()) ->
-                           [ssl_cipher_format:erl_cipher_suite()] |  [ssl_cipher_format:cipher_suite()].
+-spec filter_suites([ssl:erl_cipher_suite()] | [ssl_cipher_format:cipher_suite()], map()) ->
+                           [ssl:erl_cipher_suite()] |  [ssl_cipher_format:cipher_suite()].
 %%
 %% Description: Filter suites using supplied filter funs
 %%-------------------------------------------------------------------	
@@ -558,8 +514,8 @@ filter_suite(Suite, Filters) ->
     filter_suite(ssl_cipher_format:suite_definition(Suite), Filters).
 
 %%--------------------------------------------------------------------
--spec filter_suites([ssl_cipher_format:erl_cipher_suite()] | [ssl_cipher_format:cipher_suite()]) -> 
-                           [ssl_cipher_format:erl_cipher_suite()] | [ssl_cipher_format:cipher_suite()].
+-spec filter_suites([ssl:erl_cipher_suite()] | [ssl_cipher_format:cipher_suite()]) -> 
+                           [ssl:erl_cipher_suite()] | [ssl_cipher_format:cipher_suite()].
 %%
 %% Description: Filter suites for algorithms supported by crypto.
 %%-------------------------------------------------------------------
@@ -643,7 +599,7 @@ is_acceptable_cipher(rc4_128, Algos) ->
 is_acceptable_cipher(des_cbc, Algos) ->
     proplists:get_bool(des_cbc, Algos);
 is_acceptable_cipher('3des_ede_cbc', Algos) ->
-    proplists:get_bool(des3_cbc, Algos);
+    proplists:get_bool(des_ede3, Algos);
 is_acceptable_cipher(aes_128_cbc, Algos) ->
     proplists:get_bool(aes_cbc128, Algos);
 is_acceptable_cipher(aes_256_cbc, Algos) ->
@@ -683,12 +639,13 @@ random_bytes(N) ->
 calc_mac_hash(Type, Version,
 	      PlainFragment, #{sequence_number := SeqNo,
 			       mac_secret := MacSecret,
-			       security_parameters:=
-				   SecPars}) ->
+			       security_parameters :=
+				   #security_parameters{mac_algorithm = MacAlgorithm}}) ->
+    calc_mac_hash(Type, Version, PlainFragment, MacAlgorithm, MacSecret, SeqNo).
+%%
+calc_mac_hash(Type, Version, PlainFragment, MacAlgorithm, MacSecret, SeqNo) ->
     Length = erlang:iolist_size(PlainFragment),
-    mac_hash(Version, SecPars#security_parameters.mac_algorithm,
-	     MacSecret, SeqNo, Type,
-	     Length, PlainFragment).
+    mac_hash(Version, MacAlgorithm, MacSecret, SeqNo, Type, Length, PlainFragment).
 
 is_stream_ciphersuite(#{cipher := rc4_128}) ->
     true;
@@ -772,7 +729,6 @@ expanded_key_material(Cipher) when Cipher == aes_128_cbc;
 				   Cipher == chacha20_poly1305 ->
     unknown.  
 
-
 effective_key_bits(null) ->
     0;
 effective_key_bits(des_cbc) ->
@@ -792,18 +748,15 @@ iv_size(Cipher) when Cipher == null;
 		     Cipher == rc4_128;
 		     Cipher == chacha20_poly1305->
     0;
-
 iv_size(Cipher) when Cipher == aes_128_gcm;
 		     Cipher == aes_256_gcm ->
     4;
-
 iv_size(Cipher) ->
     block_size(Cipher).
 
 block_size(Cipher) when Cipher == des_cbc;
 			Cipher == '3des_ede_cbc' -> 
     8;
-
 block_size(Cipher) when Cipher == aes_128_cbc;
 			Cipher == aes_256_cbc;
 			Cipher == aes_128_gcm;
@@ -938,21 +891,51 @@ is_correct_padding(GenBlockCipher, {3, 1}, false) ->
 %% Padding must be checked in TLS 1.1 and after  
 is_correct_padding(#generic_block_cipher{padding_length = Len,
 					 padding = Padding}, _, _) ->
-    Len == byte_size(Padding) andalso
-		list_to_binary(lists:duplicate(Len, Len)) == Padding.
+    (Len == byte_size(Padding)) andalso (padding(Len) == Padding).
 
-get_padding(Length, BlockSize) ->
-    get_padding_aux(BlockSize, Length rem BlockSize).
+padding(PadLen) ->
+    case PadLen of
+        0 -> <<>>;
+        1 -> <<1>>;
+        2 -> <<2,2>>;
+        3 -> <<3,3,3>>;
+        4 -> <<4,4,4,4>>;
+        5 -> <<5,5,5,5,5>>;
+        6 -> <<6,6,6,6,6,6>>;
+        7 -> <<7,7,7,7,7,7,7>>;
+        8 -> <<8,8,8,8,8,8,8,8>>;
+        9 -> <<9,9,9,9,9,9,9,9,9>>;
+        10 -> <<10,10,10,10,10,10,10,10,10,10>>;
+        11 -> <<11,11,11,11,11,11,11,11,11,11,11>>;
+        12 -> <<12,12,12,12,12,12,12,12,12,12,12,12>>;
+        13 -> <<13,13,13,13,13,13,13,13,13,13,13,13,13>>;
+        14 -> <<14,14,14,14,14,14,14,14,14,14,14,14,14,14>>;
+        15 -> <<15,15,15,15,15,15,15,15,15,15,15,15,15,15,15>>;
+        _ ->
+            binary:copy(<<PadLen>>, PadLen)
+    end.
 
-get_padding_aux(_, 0) ->
-    {0, <<>>};
-get_padding_aux(BlockSize, PadLength) ->
-    N = BlockSize - PadLength,
-    {N, list_to_binary(lists:duplicate(N, N))}.
-
-random_iv(IV) ->
-    IVSz = byte_size(IV),
-    random_bytes(IVSz).
+padding_with_len(TextLen, BlockSize) ->
+    case BlockSize - (TextLen rem BlockSize) of
+        0 -> <<0>>;
+        1 -> <<1,1>>;
+        2 -> <<2,2,2>>;
+        3 -> <<3,3,3,3>>;
+        4 -> <<4,4,4,4,4>>;
+        5 -> <<5,5,5,5,5,5>>;
+        6 -> <<6,6,6,6,6,6,6>>;
+        7 -> <<7,7,7,7,7,7,7,7>>;
+        8 -> <<8,8,8,8,8,8,8,8,8>>;
+        9 -> <<9,9,9,9,9,9,9,9,9,9>>;
+        10 -> <<10,10,10,10,10,10,10,10,10,10,10>>;
+        11 -> <<11,11,11,11,11,11,11,11,11,11,11,11>>;
+        12 -> <<12,12,12,12,12,12,12,12,12,12,12,12,12>>;
+        13 -> <<13,13,13,13,13,13,13,13,13,13,13,13,13,13>>;
+        14 -> <<14,14,14,14,14,14,14,14,14,14,14,14,14,14,14>>;
+        15 -> <<15,15,15,15,15,15,15,15,15,15,15,15,15,15,15,15>>;
+        PadLen ->
+            binary:copy(<<PadLen>>, PadLen + 1)
+    end.
 
 next_iv(Bin, IV) ->
     BinSz = byte_size(Bin),
@@ -982,7 +965,7 @@ filter_suites_pubkey(ec, Ciphers, _, OtpCert) ->
                                    ec_ecdhe_suites(Ciphers)),
     filter_keyuse_suites(keyAgreement, Uses, CiphersSuites, ec_ecdh_suites(Ciphers)).
 
-filter_suites_signature(rsa, Ciphers, {3, N}) when N >= 3 ->
+filter_suites_signature(_, Ciphers, {3, N}) when N >= 3 ->
      Ciphers;
 filter_suites_signature(rsa, Ciphers, Version) ->
     (Ciphers -- ecdsa_signed_suites(Ciphers, Version)) -- dsa_signed_suites(Ciphers, Version);

@@ -50,7 +50,6 @@ removing_handler(#{id:=simple}) ->
             ok;
         Pid ->
             Ref = erlang:monitor(process,Pid),
-            unlink(Pid),
             Pid ! stop,
             receive {'DOWN',Ref,process,Pid,_} ->
                     ok
@@ -70,7 +69,7 @@ log(#{msg:=_,meta:=#{time:=_}}=Log,_Config) ->
                 do_log(
                   #{level=>error,
                     msg=>{report,{error,simple_handler_process_dead}},
-                    meta=>#{time=>erlang:system_time(microsecond)}}),
+                    meta=>#{time=>logger:timestamp()}}),
                 do_log(Log);
             _ ->
                 ?MODULE ! {log,Log}
@@ -99,7 +98,11 @@ loop(Buffer) ->
                     replay_buffer(Buffer);
                 _ ->
                     ok
-            end;
+            end,
+            %% Before stopping, we unlink the logger process to avoid
+            %% an unexpected EXIT message
+            unlink(whereis(logger)),
+            ok;
         {log,#{msg:=_,meta:=#{time:=_}}=Log} ->
             do_log(Log),
             loop(update_buffer(Buffer,Log));
@@ -126,7 +129,7 @@ drop_msg(0) ->
 drop_msg(N) ->
     [#{level=>info,
        msg=>{"Simple handler buffer full, dropped ~w messages",[N]},
-       meta=>#{time=>erlang:system_time(microsecond)}}].
+       meta=>#{time=>logger:timestamp()}}].
 
 %%%-----------------------------------------------------------------
 %%% Internal

@@ -46,7 +46,7 @@
 -define(MIN_READLINE_SIZE, 256).
 -define(LARGEFILESIZE, (1 bsl 63)).
 
--export([copy/3]).
+-export([copy/3, start/0]).
 
 -include("file_int.hrl").
 
@@ -83,7 +83,23 @@ internal_normalize_utf8(_) ->
 is_translatable(_) ->
     erlang:nif_error(undefined).
 
-%%
+%% This is a janitor process used to close files whose controlling process has
+%% died. The emulator will be torn down if this is killed.
+start() ->
+    helper_loop().
+
+helper_loop() ->
+    receive
+        {close, FRef} when is_reference(FRef) -> delayed_close_nif(FRef);
+        _ -> ok
+    end,
+    helper_loop().
+
+on_load() ->
+    %% This is spawned as a system process to prevent init:restart/0 from
+    %% killing it.
+    Pid = erts_internal:spawn_system_process(?MODULE, start, []),
+    ok = erlang:load_nif(atom_to_list(?MODULE), Pid).
 
 %% Returns {error, Reason} | {ok, BytesCopied}
 copy(#file_descriptor{module = ?MODULE} = Source,
@@ -93,9 +109,6 @@ copy(#file_descriptor{module = ?MODULE} = Source,
        is_atom(Length) ->
     %% XXX Should be moved down to the driver for optimization.
     file:copy_opened(Source, Dest, Length).
-
-on_load() ->
-    ok = erlang:load_nif(atom_to_list(?MODULE), 0).
 
 open(Name, Modes) ->
     %% The try/catch pattern seen here is used throughout the file to adhere to
@@ -482,6 +495,8 @@ truncate_nif(_FileRef) ->
     erlang:nif_error(undef).
 get_handle_nif(_FileRef) ->
     erlang:nif_error(undef).
+delayed_close_nif(_FileRef) ->
+    erlang:nif_error(undef).
 
 %%
 %% Quality-of-life helpers
@@ -557,12 +572,13 @@ list_dir_convert([RawName | Rest], SkipInvalid, Result) ->
         {error, ignore} ->
             list_dir_convert(Rest, SkipInvalid, Result);
         {error, warning} ->
-            %% this is equal to calling error_logger:warning_msg/2 which
-            %% we don't want to do from code_server during system boot
+            %% This is equal to calling logger:warning/3 which
+            %% we don't want to do from code_server during system boot.
+            %% We don't want to call logger:timestamp() either.
             logger ! {log,warning,"Non-unicode filename ~p ignored\n", [RawName],
                       #{pid=>self(),
                         gl=>group_leader(),
-                        time=>erlang:system_time(microsecond),
+                        time=>os:system_time(microsecond),
                         error_logger=>#{tag=>warning_msg}}},
             list_dir_convert(Rest, SkipInvalid, Result);
         {error, _} ->

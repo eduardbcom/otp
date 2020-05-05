@@ -41,7 +41,7 @@
 -export([t_delete_object/1, t_init_table/1, t_whitebox/1,
          select_bound_chunk/1,
 	 t_delete_all_objects/1, t_insert_list/1, t_test_ms/1,
-	 t_select_delete/1,t_select_replace/1,t_ets_dets/1]).
+	 t_select_delete/1,t_select_replace/1,t_select_replace_next_bug/1,t_ets_dets/1]).
 
 -export([ordered/1, ordered_match/1, interface_equality/1,
 	 fixtable_next/1, fixtable_insert/1, rename/1, rename_unnamed/1, evil_rename/1,
@@ -59,6 +59,7 @@
 -export([otp_5340/1]).
 -export([otp_6338/1]).
 -export([otp_6842_select_1000/1]).
+-export([select_mbuf_trapping/1]).
 -export([otp_7665/1]).
 -export([meta_wb/1]).
 -export([grow_shrink/1, grow_pseudo_deleted/1, shrink_pseudo_deleted/1]).
@@ -125,10 +126,12 @@ all() ->
      select_bound_chunk,
      t_init_table, t_whitebox, t_delete_all_objects,
      t_insert_list, t_test_ms, t_select_delete, t_select_replace,
+     t_select_replace_next_bug,
      t_ets_dets, memory, t_select_reverse, t_bucket_disappears,
      t_named_select,
      select_fail, t_insert_new, t_repair_continuation,
      otp_5340, otp_6338, otp_6842_select_1000, otp_7665,
+     select_mbuf_trapping,
      otp_8732, meta_wb, grow_shrink, grow_pseudo_deleted,
      shrink_pseudo_deleted, {group, meta_smp}, smp_insert,
      smp_fixed_delete, smp_unfix_fix, smp_select_replace, 
@@ -1465,6 +1468,25 @@ t_select_replace(Config) when is_list(Config) ->
     ets:delete(T2),
 
     verify_etsmem(EtsMem).
+
+%% OTP-15346: Bug caused select_replace of bound key to corrupt static stack
+%% used by ets:next and ets:prev.
+t_select_replace_next_bug(Config) when is_list(Config) ->
+    T = ets:new(k, [ordered_set]),
+    [ets:insert(T, {I, value}) || I <- lists:seq(1,10)],
+    1 = ets:first(T),
+
+    %% Make sure select_replace does not leave pointer
+    %% to deallocated {2,value} in static stack.
+    MS = [{{2,value}, [], [{{2,"new_value"}}]}],
+    1 = ets:select_replace(T, MS),
+
+    %% This would crash or give wrong result at least on DEBUG emulator
+    %% where deallocated memory is overwritten.
+    2 = ets:next(T, 1),
+
+    ets:delete(T).
+
 
 %% Test that partly bound keys gives faster matches.
 partly_bound(Config) when is_list(Config) ->
@@ -5110,6 +5132,61 @@ otp_6338(Config) when is_list(Config) ->
     lists:foreach(fun(X) -> ets:insert(T,X) end,L),
     [[4839,recv]] = ets:match(T,{[{sbm,ppb2_bs12@blade_0_8},'$1'],'$2'}),
     ets:delete(T).
+
+%% OTP-15660: Verify select not doing excessive trapping
+%%            when process have mbuf heap fragments.
+select_mbuf_trapping(Config) when is_list(Config) ->
+    select_mbuf_trapping_do(set),
+    select_mbuf_trapping_do(ordered_set).
+
+select_mbuf_trapping_do(Type) ->
+    T = ets:new(xxx, [Type]),
+    NKeys = 50,
+    [ets:insert(T, {K, value}) || K <- lists:seq(1,NKeys)],
+
+    {priority, Prio} = process_info(self(), priority),
+    Tracee = self(),
+    [SchedTracer]
+	= start_loopers(1, Prio,
+			fun (SC) ->
+				receive
+				    {trace, Tracee, out, _} ->
+					SC+1;
+				    done ->
+					Tracee ! {schedule_count, SC},
+                                        exit(normal)
+				end
+			end,
+			0),
+
+    erlang:garbage_collect(),
+    1 = erlang:trace(self(), true, [running,{tracer,SchedTracer}]),
+
+    %% Artificially create an mbuf heap fragment
+    MbufTerm = "Frag me up",
+    MbufTerm = erts_debug:set_internal_state(mbuf, MbufTerm),
+
+    Keys = ets:select(T, [{{'$1', value}, [], ['$1']}]),
+    NKeys = length(Keys),
+
+    1 = erlang:trace(self(), false, [running]),
+    Ref = erlang:trace_delivered(Tracee),
+    receive
+        {trace_delivered, Tracee, Ref} ->
+            SchedTracer ! done
+    end,
+    receive
+	{schedule_count, N} ->
+	    io:format("~p context switches: ~p", [Type,N]),
+	    if
+		N < 3 -> ok;
+		true -> ct:fail(failed)
+	    end
+    end,
+    true = ets:delete(T),
+    ok.
+
+
 
 %% Elements could come in the wrong order in a bag if a rehash occurred.
 otp_5340(Config) when is_list(Config) ->

@@ -32,7 +32,7 @@
     <rev>A</rev>
     <file>logger_disk_log_h.xml</file>
   </header>
-  <module>logger_disk_log_h</module>
+  <module since="OTP 21.0">logger_disk_log_h</module>
   <modulesummary>A disk_log based handler for Logger</modulesummary>
 
   <description>
@@ -66,6 +66,10 @@
 	corresponds to the <c>name</c> property in the
 	<seealso marker="disk_log#open-1"><c>dlog_option()</c></seealso>
 	datatype.</p>
+	<p>The value is set when the handler is added, and it can not
+	  be changed in runtime.</p>
+	<p>Defaults to the same name as the handler identity, in the
+	  current directory.</p>
       </item>
       <tag><c>type</c></tag>
       <item>
@@ -73,6 +77,8 @@
 	corresponds to the <c>type</c> property in the
 	<seealso marker="disk_log#open-1"><c>dlog_option()</c></seealso>
 	datatype.</p>
+	<p>The value is set when the handler is added, and it can not
+	  be changed in runtime.</p>
 	<p>Defaults to <c>wrap</c>.</p>
       </item>
       <tag><c>max_no_files</c></tag>
@@ -82,6 +88,8 @@
 	corresponds to the <c>MaxNoFiles</c> element in the <c>size</c> property in the
 	<seealso marker="disk_log#open-1"><c>dlog_option()</c></seealso>
 	datatype.</p>
+	<p>The value is set when the handler is added, and it can not
+	  be changed in runtime.</p>
 	<p>Defaults to <c>10</c>.</p>
 	<p>The setting has no effect on a halt log.</p>
       </item>
@@ -93,6 +101,8 @@
 	corresponds to the <c>MaxNoBytes</c> element in the <c>size</c> property in the
 	<seealso marker="disk_log#open-1"><c>dlog_option()</c></seealso>
 	datatype.</p>
+	<p>The value is set when the handler is added, and it can not
+	  be changed in runtime.</p>
 	<p>Defaults to <c>1048576</c> bytes for a wrap log, and
 	<c>infinity</c> for a halt log.</p>
       </item>
@@ -138,7 +148,7 @@ erl -kernel logger '[{handler,default,logger_disk_log_h,
   <funcs>
 
     <func>
-      <name name="filesync" arity="1" clause_i="1"/>
+      <name name="filesync" arity="1" clause_i="1" since="OTP 21.0"/>
       <fsummary>Writes buffered data to disk.</fsummary>
       <desc>
         <p>Write buffered data to disk.</p>

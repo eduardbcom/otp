@@ -118,7 +118,11 @@
 
 -type ecdsa_public()  :: key_integer() .
 -type ecdsa_private() :: key_integer() .
--type ecdsa_params()  :: ec_named_curve() | edwards_curve() | ec_explicit_curve() .
+-type ecdsa_params()  :: ec_named_curve() | ec_explicit_curve() .
+
+-type eddsa_public()  :: key_integer() .
+-type eddsa_private() :: key_integer() .
+-type eddsa_params()  :: edwards_curve_ed() .
 
 -type srp_public() :: key_integer() .
 -type srp_private() :: key_integer() .
@@ -135,7 +139,7 @@
 
 -type ecdh_public()  :: key_integer() .
 -type ecdh_private() :: key_integer() .
--type ecdh_params()  :: ec_named_curve() | edwards_curve() | ec_explicit_curve() .
+-type ecdh_params()  :: ec_named_curve() | edwards_curve_dh() | ec_explicit_curve() .
 
 
 %%% Curves
@@ -247,8 +251,9 @@
                         | wtls9
                           .
 
--type edwards_curve() :: x25519
-                       | x448 .
+-type edwards_curve_dh() :: x25519 | x448 .
+
+-type edwards_curve_ed() :: ed25519 | ed448 .
 
 %%% 
 -type block_cipher_with_iv() :: cbc_cipher()
@@ -328,7 +333,7 @@ stop() ->
                                         ], 
                              PKs :: [rsa | dss | ecdsa | dh | ecdh | ec_gf2m],
                              Macs :: [hmac | cmac | poly1305],
-                             Curves :: [ec_named_curve() | edwards_curve()],
+                             Curves :: [ec_named_curve() | edwards_curve_dh() | edwards_curve_ed()],
                              RSAopts :: [rsa_sign_verify_opt() | rsa_opt()] .
 supports()->
     {Hashs, PubKeys, Ciphers, Macs, Curves, RsaOpts} = algorithms(),
@@ -507,17 +512,17 @@ block_encrypt(Type, Key, Ivec, PlainText) when Type =:= des_cbc;
                                                Type =:= aes_cbc256;
                                                Type =:= aes_cbc;
                                                Type =:= rc2_cbc ->
-    block_crypt_nif(Type, Key, Ivec, PlainText, true);
+    notsup_to_error(block_crypt_nif(Type, Key, Ivec, PlainText, true));
 block_encrypt(Type, Key0, Ivec, PlainText) when Type =:= des3_cbc;
                                                 Type =:= des_ede3 ->
     Key = check_des3_key(Key0),
-    block_crypt_nif(des_ede3_cbc, Key, Ivec, PlainText, true);
+    notsup_to_error(block_crypt_nif(des_ede3_cbc, Key, Ivec, PlainText, true));
 block_encrypt(des3_cbf, Key0, Ivec, PlainText) -> % cfb misspelled
     Key = check_des3_key(Key0),
-    block_crypt_nif(des_ede3_cbf, Key, Ivec, PlainText, true);
+    notsup_to_error(block_crypt_nif(des_ede3_cbf, Key, Ivec, PlainText, true));
 block_encrypt(des3_cfb, Key0, Ivec, PlainText) ->
     Key = check_des3_key(Key0),
-    block_crypt_nif(des_ede3_cfb, Key, Ivec, PlainText, true);
+    notsup_to_error(block_crypt_nif(des_ede3_cfb, Key, Ivec, PlainText, true));
 block_encrypt(aes_ige256, Key, Ivec, PlainText) ->
     notsup_to_error(aes_ige_crypt_nif(Key, Ivec, PlainText, true));
 block_encrypt(Type, Key, Ivec, {AAD, PlainText}) when Type =:= aes_gcm;
@@ -544,17 +549,17 @@ block_decrypt(Type, Key, Ivec, Data) when Type =:= des_cbc;
                                           Type =:= aes_cfb128;
                                           Type =:= aes_cbc256;
                                           Type =:= rc2_cbc ->
-    block_crypt_nif(Type, Key, Ivec, Data, false);
+    notsup_to_error(block_crypt_nif(Type, Key, Ivec, Data, false));
 block_decrypt(Type, Key0, Ivec, Data) when Type =:= des3_cbc;
                                            Type =:= des_ede3 ->
     Key = check_des3_key(Key0),
-    block_crypt_nif(des_ede3_cbc, Key, Ivec, Data, false);
+    notsup_to_error(block_crypt_nif(des_ede3_cbc, Key, Ivec, Data, false));
 block_decrypt(des3_cbf, Key0, Ivec, Data) -> % cfb misspelled
     Key = check_des3_key(Key0),
-    block_crypt_nif(des_ede3_cbf, Key, Ivec, Data, false);
+    notsup_to_error(block_crypt_nif(des_ede3_cbf, Key, Ivec, Data, false));
 block_decrypt(des3_cfb, Key0, Ivec, Data) ->
     Key = check_des3_key(Key0),
-    block_crypt_nif(des_ede3_cfb, Key, Ivec, Data, false);
+    notsup_to_error(block_crypt_nif(des_ede3_cfb, Key, Ivec, Data, false));
 block_decrypt(aes_ige256, Key, Ivec, Data) ->
     notsup_to_error(aes_ige_crypt_nif(Key, Ivec, Data, false));
 block_decrypt(Type, Key, Ivec, {AAD, Data, Tag}) when Type =:= aes_gcm;
@@ -566,13 +571,13 @@ block_decrypt(Type, Key, Ivec, {AAD, Data, Tag}) when Type =:= aes_gcm;
 -spec block_encrypt(Type::block_cipher_without_iv(), Key::key(), PlainText::iodata()) -> binary().
 
 block_encrypt(Type, Key, PlainText) ->
-    block_crypt_nif(Type, Key, PlainText, true).
+    notsup_to_error(block_crypt_nif(Type, Key, PlainText, true)).
 
 
 -spec block_decrypt(Type::block_cipher_without_iv(), Key::key(), Data::iodata()) -> binary().
 
 block_decrypt(Type, Key, Data) ->
-    block_crypt_nif(Type, Key, Data, false).
+    notsup_to_error(block_crypt_nif(Type, Key, Data, false)).
 
 
 -spec next_iv(Type:: cbc_cipher(), Data) -> NextIVec when % Type :: cbc_cipher(), %des_cbc | des3_cbc | aes_cbc | aes_ige,
@@ -777,7 +782,7 @@ rand_seed_nif(_Seed) -> ?nif_stub.
 %%% Sign/verify
 %%%
 %%%================================================================
--type pk_sign_verify_algs() :: rsa | dss | ecdsa .
+-type pk_sign_verify_algs() :: rsa | dss | ecdsa | eddsa .
 
 -type pk_sign_verify_opts() :: [ rsa_sign_verify_opt() ] .
 
@@ -801,7 +806,8 @@ rand_seed_nif(_Seed) -> ?nif_stub.
                       Msg :: binary() | {digest,binary()},
                       Key :: rsa_private()
                            | dss_private()
-                           | [ecdsa_private()|ecdsa_params()]
+                           | [ecdsa_private() | ecdsa_params()]
+                           | [eddsa_private() | eddsa_params()]
                            | engine_key_ref(),
                       Signature :: binary() .
 
@@ -820,6 +826,7 @@ sign(Algorithm, Type, Data, Key) ->
                       Key :: rsa_private()
                            | dss_private()
                            | [ecdsa_private() | ecdsa_params()]
+                           | [eddsa_private() | eddsa_params()]
                            | engine_key_ref(),
                       Options :: pk_sign_verify_opts(),
                       Signature :: binary() .
@@ -842,12 +849,14 @@ pkey_sign_nif(_Algorithm, _Type, _Digest, _Key, _Options) -> ?nif_stub.
                    when Algorithm :: pk_sign_verify_algs(),
                         DigestType :: rsa_digest_type()
                                     | dss_digest_type()
-                                    | ecdsa_digest_type(),
+                                    | ecdsa_digest_type()
+                                    | none,
                         Msg :: binary() | {digest,binary()},
                         Signature :: binary(),
-                        Key :: rsa_private()
-                             | dss_private()
-                             | [ecdsa_private() | ecdsa_params()]
+                        Key :: rsa_public()
+                             | dss_public()
+                             | [ecdsa_public() | ecdsa_params()]
+                             | [eddsa_public() | eddsa_params()]
                              | engine_key_ref(),
                         Result :: boolean().
 
@@ -865,6 +874,7 @@ verify(Algorithm, Type, Data, Signature, Key) ->
                         Key :: rsa_public()
                              | dss_public()
                              | [ecdsa_public() | ecdsa_params()]
+                             | [eddsa_public() | eddsa_params()]
                              | engine_key_ref(),
                         Options :: pk_sign_verify_opts(),
                         Result :: boolean().
@@ -1214,7 +1224,11 @@ engine_load_1(Engine, PreCmds, PostCmds, EngineMethods) ->
         throw:Error ->
             %% The engine couldn't initialise, release the structural reference
             ok = engine_free_nif(Engine),
-            throw(Error)
+            throw(Error);
+        error:badarg ->
+            %% For example bad argument list, release the structural reference
+            ok = engine_free_nif(Engine),
+            error(badarg)
     end.
 
 engine_load_2(Engine, PostCmds, EngineMethods) ->
@@ -1762,7 +1776,9 @@ ec_key_generate(_Curve, _Key) -> ?nif_stub.
 
 ecdh_compute_key_nif(_Others, _Curve, _My) -> ?nif_stub.
 
--spec ec_curves() -> [EllipticCurve] when EllipticCurve :: ec_named_curve() | edwards_curve() .
+-spec ec_curves() -> [EllipticCurve] when EllipticCurve :: ec_named_curve()
+                                                         | edwards_curve_dh()
+                                                         | edwards_curve_ed() .
 
 ec_curves() ->
     crypto_ec_curves:curves().
@@ -2026,7 +2042,7 @@ check_otp_test_engine(LibDir) ->
     case filelib:wildcard("otp_test_engine*", LibDir) of
         [] ->
             {error, notexist};
-        [LibName] ->
+        [LibName|_] ->                          % In case of Valgrind there could be more than one
             LibPath = filename:join(LibDir,LibName),
             case filelib:is_file(LibPath) of
                 true ->

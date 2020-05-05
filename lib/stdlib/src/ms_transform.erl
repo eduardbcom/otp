@@ -556,8 +556,8 @@ tg({call, Line, {remote,_,{atom,_,erlang},{atom, Line2, FunName}},ParaList},
 			       FunName,length(ParaList)}}) 
     end;
 tg({call, Line, {remote,_,{atom,_,ModuleName},
-		 {atom, _, FunName}},_ParaList},B) ->
-    throw({error,Line,{?ERR_GENREMOTECALL+B#tgd.eb,ModuleName,FunName}});
+		 {atom, _, FunName}},ParaList},B) ->
+    throw({error,Line,{?ERR_GENREMOTECALL+B#tgd.eb,ModuleName,FunName,length(ParaList)}});
 tg({cons,Line, H, T},B) -> 
     {cons, Line, tg(H,B), tg(T,B)};
 tg({nil, Line},_B) ->
@@ -946,6 +946,7 @@ real_guard_function(node,0) -> true;
 real_guard_function(node,1) -> true;
 real_guard_function(round,1) -> true;
 real_guard_function(size,1) -> true;
+real_guard_function(bit_size,1) -> true;
 real_guard_function(map_size,1) -> true;
 real_guard_function(map_get,2) -> true;
 real_guard_function(tl,1) -> true;

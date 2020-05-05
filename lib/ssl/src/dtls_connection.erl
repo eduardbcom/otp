@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2013-2018. All Rights Reserved.
+%% Copyright Ericsson AB 2013-2019. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -39,7 +39,7 @@
 -export([start_fsm/8, start_link/7, init/1, pids/1]).
 
 %% State transition handling	 
--export([next_record/1, next_event/3, next_event/4,  handle_common_event/4]).
+-export([next_event/3, next_event/4, handle_protocol_record/3]).
 
 %% Handshake handling
 -export([renegotiate/2, send_handshake/2, 
@@ -50,8 +50,7 @@
 -export([encode_alert/3, send_alert/2, send_alert_in_connection/2, close/5, protocol_name/0]).
 
 %% Data handling
--export([encode_data/3, passive_receive/2, next_record_if_active/1,
-	 send/3, socket/5, setopts/3, getopts/3]).
+-export([next_record/1, socket/4, setopts/3, getopts/3]).
 
 %% gen_statem state functions
 -export([init/3, error/3, downgrade/3, %% Initiation and take down states
@@ -80,7 +79,7 @@ start_fsm(Role, Host, Port, Socket, {#ssl_options{erl_dist = false},_, Tracker} 
     end.
 
 %%--------------------------------------------------------------------
--spec start_link(atom(), host(), inet:port_number(), port(), list(), pid(), tuple()) ->
+-spec start_link(atom(), ssl:host(), inet:port_number(), port(), list(), pid(), tuple()) ->
 			{ok, pid()} | ignore |  {error, reason()}.
 %%
 %% Description: Creates a gen_statem process which calls Module:init/1 to
@@ -107,9 +106,11 @@ pids(_) ->
 %%====================================================================
 %% State transition handling
 %%====================================================================	     
-next_record(#state{unprocessed_handshake_events = N} = State) when N > 0 ->
-    {no_record, State#state{unprocessed_handshake_events = N-1}};
-					 
+next_record(#state{handshake_env = 
+                       #handshake_env{unprocessed_handshake_events = N} = HsEnv} 
+            = State) when N > 0 ->
+    {no_record, State#state{handshake_env = 
+                                HsEnv#handshake_env{unprocessed_handshake_events = N-1}}};
 next_record(#state{protocol_buffers =
 		       #protocol_buffers{dtls_cipher_texts = [#ssl_tls{epoch = Epoch} = CT | Rest]}
 		   = Buffers,
@@ -141,14 +142,14 @@ next_record(#state{protocol_buffers =
     next_record(State#state{protocol_buffers =
                                 Buffers#protocol_buffers{dtls_cipher_texts = Rest},
                             connection_states = ConnectionStates});
-next_record(#state{role = server,
-		   socket = {Listener, {Client, _}}} = State) -> 
+next_record(#state{static_env = #static_env{role = server,
+                                            socket = {Listener, {Client, _}}}} = State) ->
     dtls_packet_demux:active_once(Listener, Client, self()),
     {no_record, State};
-next_record(#state{role = client,
-		   socket = {_Server, Socket} = DTLSSocket,
-                   close_tag = CloseTag,
-		   transport_cb = Transport} = State) -> 
+next_record(#state{static_env = #static_env{role = client,
+                                            socket = {_Server, Socket} = DTLSSocket,
+                                            close_tag = CloseTag,
+                                            transport_cb = Transport}} = State) ->
     case dtls_socket:setopts(Transport, Socket, [{active,once}]) of
         ok ->
  	    {no_record, State};
@@ -162,9 +163,9 @@ next_record(State) ->
 next_event(StateName, Record, State) ->
     next_event(StateName, Record, State, []).
 
-next_event(connection = StateName, no_record,
+next_event(StateName, no_record,
 	   #state{connection_states = #{current_read := #{epoch := CurrentEpoch}}} = State0, Actions) ->
-    case next_record_if_active(State0) of
+    case next_record(State0) of
 	{no_record, State} ->
             ssl_connection:hibernate_after(StateName, State, Actions);
         {#ssl_tls{epoch = CurrentEpoch,
@@ -178,21 +179,18 @@ next_event(connection = StateName, no_record,
 	{#ssl_tls{epoch = Epoch,
 		  type = ?HANDSHAKE,
 		  version = _Version}, State1} = _Record when Epoch == CurrentEpoch-1 ->
-	    {State2, MoreActions} = send_handshake_flight(State1, CurrentEpoch),
-            {NextRecord, State} = next_record(State2),
-            next_event(StateName, NextRecord, State, Actions ++ MoreActions);
+	    {State, MoreActions} = send_handshake_flight(State1, CurrentEpoch),
+            next_event(StateName, no_record, State, Actions ++ MoreActions);
         %% From FLIGHT perspective CHANGE_CIPHER_SPEC is treated as a handshake
         {#ssl_tls{epoch = Epoch,
 		  type = ?CHANGE_CIPHER_SPEC,
 		  version = _Version}, State1} = _Record when Epoch == CurrentEpoch-1 ->
-	    {State2, MoreActions} = send_handshake_flight(State1, CurrentEpoch),
-	    {NextRecord, State} = next_record(State2),
-            next_event(StateName, NextRecord, State, Actions ++ MoreActions);
+	    {State, MoreActions} = send_handshake_flight(State1, CurrentEpoch),
+            next_event(StateName, no_record, State, Actions ++ MoreActions);
 	{#ssl_tls{epoch = _Epoch,
-		  version = _Version}, State1} ->
+		  version = _Version}, State} ->
 	    %% TODO maybe buffer later epoch
-            {Record, State} = next_record(State1),
-            next_event(StateName, Record, State, Actions); 
+            next_event(StateName, no_record, State, Actions); 
 	{#alert{} = Alert, State} ->
 	    {next_state, StateName, State, [{next_event, internal, Alert} | Actions]}
     end;
@@ -210,24 +208,20 @@ next_event(connection = StateName, Record,
 	#ssl_tls{epoch = Epoch,
                  type = ?HANDSHAKE,
                  version = _Version} when Epoch == CurrentEpoch-1 ->
-	    {State1, MoreActions} = send_handshake_flight(State0, CurrentEpoch),
-            {NextRecord, State} = next_record(State1),
-            next_event(StateName, NextRecord, State, Actions ++ MoreActions);
+	    {State, MoreActions} = send_handshake_flight(State0, CurrentEpoch),
+            next_event(StateName, no_record, State, Actions ++ MoreActions);
         %% From FLIGHT perspective CHANGE_CIPHER_SPEC is treated as a handshake
         #ssl_tls{epoch = Epoch,
                  type = ?CHANGE_CIPHER_SPEC,
                  version = _Version} when Epoch == CurrentEpoch-1 ->
-	    {State1, MoreActions} = send_handshake_flight(State0, CurrentEpoch),
-            {NextRecord, State} = next_record(State1),
-            next_event(StateName, NextRecord, State, Actions ++ MoreActions); 
+	    {State, MoreActions} = send_handshake_flight(State0, CurrentEpoch),
+            next_event(StateName, no_record, State, Actions ++ MoreActions); 
         _ -> 
             next_event(StateName, no_record, State0, Actions) 
     end;
 next_event(StateName, Record, 
 	   #state{connection_states = #{current_read := #{epoch := CurrentEpoch}}} = State0, Actions) ->
     case Record of
-	no_record ->
-            {next_state, StateName, State0, Actions};
         #ssl_tls{epoch = CurrentEpoch,
                  version = Version} = Record ->
             State = dtls_version(StateName, Version, State0),
@@ -236,44 +230,49 @@ next_event(StateName, Record,
 	#ssl_tls{epoch = _Epoch,
 		 version = _Version} = _Record ->
 	    %% TODO maybe buffer later epoch
-            {Record, State} = next_record(State0),
-            next_event(StateName, Record, State, Actions); 
+            next_event(StateName, no_record, State0, Actions); 
 	#alert{} = Alert ->
 	    {next_state, StateName, State0, [{next_event, internal, Alert} | Actions]}
     end.
 
-handle_common_event(internal, #alert{} = Alert, StateName, 
-		    #state{negotiated_version = Version} = State) ->
-    handle_own_alert(Alert, Version, StateName, State);
+%%% DTLS record protocol level application data messages 
+
+handle_protocol_record(#ssl_tls{type = ?APPLICATION_DATA, fragment = Data}, StateName0, State0) ->
+    case ssl_connection:read_application_data(Data, State0) of
+	{stop, _, _} = Stop->
+            Stop;
+	{Record, State1} ->
+            {next_state, StateName, State, Actions} = next_event(StateName0, Record, State1), 
+            ssl_connection:hibernate_after(StateName, State, Actions)
+    end;
 %%% DTLS record protocol level handshake messages 
-handle_common_event(internal, #ssl_tls{type = ?HANDSHAKE,
+handle_protocol_record(#ssl_tls{type = ?HANDSHAKE,
 				       fragment = Data}, 
 		    StateName, 
 		    #state{protocol_buffers = Buffers0,
-			   negotiated_version = Version} = State0) ->
+			   connection_env = #connection_env{negotiated_version = Version}} = State) ->
     try
 	case dtls_handshake:get_dtls_handshake(Version, Data, Buffers0) of
 	    {[], Buffers} ->
-		{Record, State} = next_record(State0#state{protocol_buffers = Buffers}),
-		next_event(StateName, Record, State);
+		next_event(StateName, no_record, State#state{protocol_buffers = Buffers});
 	    {Packets, Buffers} ->
-		State = State0#state{protocol_buffers = Buffers},
+		HsEnv = State#state.handshake_env,
 		Events = dtls_handshake_events(Packets),
                 {next_state, StateName, 
-                 State#state{unprocessed_handshake_events = unprocessed_events(Events)}, Events}
+                 State#state{protocol_buffers = Buffers,
+                             handshake_env = 
+                                 HsEnv#handshake_env{unprocessed_handshake_events 
+                                                     = unprocessed_events(Events)}}, Events}
 	end
     catch throw:#alert{} = Alert ->
-	    handle_own_alert(Alert, Version, StateName, State0)
+	    handle_own_alert(Alert, Version, StateName, State)
     end;
-%%% DTLS record protocol level application data messages 
-handle_common_event(internal, #ssl_tls{type = ?APPLICATION_DATA, fragment = Data}, StateName, State) ->
-    {next_state, StateName, State, [{next_event, internal, {application_data, Data}}]};
 %%% DTLS record protocol level change cipher messages
-handle_common_event(internal, #ssl_tls{type = ?CHANGE_CIPHER_SPEC, fragment = Data}, StateName, State) ->
+handle_protocol_record(#ssl_tls{type = ?CHANGE_CIPHER_SPEC, fragment = Data}, StateName, State) ->
     {next_state, StateName, State, [{next_event, internal, #change_cipher_spec{type = Data}}]};
 %%% DTLS record protocol level Alert messages
-handle_common_event(internal, #ssl_tls{type = ?ALERT, fragment = EncAlerts}, StateName,
-		    #state{negotiated_version = Version} = State) ->
+handle_protocol_record(#ssl_tls{type = ?ALERT, fragment = EncAlerts}, StateName,
+                       #state{connection_env = #connection_env{negotiated_version = Version}} = State) ->
     case decode_alerts(EncAlerts) of
 	Alerts = [_|_] ->
 	    handle_alerts(Alerts,  {next_state, StateName, State});
@@ -281,32 +280,31 @@ handle_common_event(internal, #ssl_tls{type = ?ALERT, fragment = EncAlerts}, Sta
 	    handle_own_alert(Alert, Version, StateName, State)
     end;
 %% Ignore unknown TLS record level protocol messages
-handle_common_event(internal, #ssl_tls{type = _Unknown}, StateName, State) ->
-    {next_state, StateName, State}.
+handle_protocol_record(#ssl_tls{type = _Unknown}, StateName, State) ->
+    {next_state, StateName, State, []}.
 
 %%====================================================================
 %% Handshake handling
 %%====================================================================	     
 
-renegotiate(#state{role = client} = State, Actions) ->
+renegotiate(#state{static_env = #static_env{role = client}} = State, Actions) ->
     %% Handle same way as if server requested
     %% the renegotiation
     {next_state, connection, State,
      [{next_event, internal, #hello_request{}} | Actions]};
 
-renegotiate(#state{role = server} = State0, Actions) ->
+renegotiate(#state{static_env = #static_env{role = server}} = State0, Actions) ->
     HelloRequest = ssl_handshake:hello_request(),
     State1 = prepare_flight(State0),
-    {State2, MoreActions} = send_handshake(HelloRequest, State1),
-    {Record, State} = next_record(State2),
-    next_event(hello, Record, State, Actions ++ MoreActions).
+    {State, MoreActions} = send_handshake(HelloRequest, State1),
+    next_event(hello, no_record, State, Actions ++ MoreActions).
 
 send_handshake(Handshake, #state{connection_states = ConnectionStates} = State) ->
     #{epoch := Epoch} = ssl_record:current_connection_state(ConnectionStates, write),
     send_handshake_flight(queue_handshake(Handshake, State), Epoch).
 
-queue_handshake(Handshake0, #state{tls_handshake_history = Hist0, 
-				   negotiated_version = Version,
+queue_handshake(Handshake0, #state{handshake_env = #handshake_env{tls_handshake_history = Hist0} = HsEnv, 
+                                   connection_env = #connection_env{negotiated_version = Version},
 				   flight_buffer = #{handshakes := HsBuffer0,
 						     change_cipher_spec := undefined,
 						     next_sequence := Seq} = Flight0} = State) ->
@@ -314,17 +312,17 @@ queue_handshake(Handshake0, #state{tls_handshake_history = Hist0,
     Hist = update_handshake_history(Handshake0, Handshake, Hist0),
     State#state{flight_buffer = Flight0#{handshakes => [Handshake | HsBuffer0],
 					 next_sequence => Seq +1},
-		tls_handshake_history = Hist};
+	handshake_env = HsEnv#handshake_env{tls_handshake_history = Hist}};
 
-queue_handshake(Handshake0, #state{tls_handshake_history = Hist0, 
-				   negotiated_version = Version,
+queue_handshake(Handshake0, #state{handshake_env = #handshake_env{tls_handshake_history = Hist0} = HsEnv, 
+                                   connection_env = #connection_env{negotiated_version = Version},
 				   flight_buffer = #{handshakes_after_change_cipher_spec := Buffer0,
 						     next_sequence := Seq} = Flight0} = State) ->
     Handshake = dtls_handshake:encode_handshake(Handshake0, Version, Seq),
     Hist = update_handshake_history(Handshake0, Handshake, Hist0),
     State#state{flight_buffer = Flight0#{handshakes_after_change_cipher_spec => [Handshake | Buffer0],
 					 next_sequence => Seq +1},
-		tls_handshake_history = Hist}.
+                handshake_env = HsEnv#handshake_env{tls_handshake_history = Hist}}.
 
 queue_change_cipher(ChangeCipher, #state{flight_buffer = Flight,
 					 connection_states = ConnectionStates0} = State) -> 
@@ -336,11 +334,14 @@ queue_change_cipher(ChangeCipher, #state{flight_buffer = Flight,
 reinit(State) ->
     %% To be API compatible with TLS NOOP here
     reinit_handshake_data(State).
-reinit_handshake_data(#state{protocol_buffers = Buffers} = State) ->
-    State#state{premaster_secret = undefined,
-		public_key_info = undefined,
-                tls_handshake_history = ssl_handshake:init_handshake_history(),
-                flight_state = {retransmit, ?INITIAL_RETRANSMIT_TIMEOUT},
+reinit_handshake_data(#state{static_env = #static_env{data_tag = DataTag},
+                             protocol_buffers = Buffers,
+                             protocol_specific = PS,
+                             handshake_env = HsEnv} = State) ->
+    State#state{handshake_env = HsEnv#handshake_env{tls_handshake_history = ssl_handshake:init_handshake_history(),
+                                                    public_key_info = undefined,
+                                                    premaster_secret = undefined},
+                protocol_specific = PS#{flight_state => initial_flight_state(DataTag)},
 		flight_buffer = new_flight(),
                 protocol_buffers =
 		    Buffers#protocol_buffers{
@@ -364,9 +365,9 @@ empty_connection_state(ConnectionEnd, BeastMitigation) ->
 encode_alert(#alert{} = Alert, Version, ConnectionStates) ->
     dtls_record:encode_alert_record(Alert, Version, ConnectionStates).
 
-send_alert(Alert, #state{negotiated_version = Version,
-			 socket = Socket,
-			 transport_cb = Transport,
+send_alert(Alert, #state{static_env = #static_env{socket = Socket,
+                                                  transport_cb = Transport},
+                         connection_env = #connection_env{negotiated_version = Version},
 			 connection_states = ConnectionStates0} = State0) ->
     {BinMsg, ConnectionStates} =
 	encode_alert(Alert, Version, ConnectionStates0),
@@ -390,33 +391,13 @@ protocol_name() ->
 %% Data handling
 %%====================================================================	 
 
-encode_data(Data, Version, ConnectionStates0)->
-    dtls_record:encode_data(Data, Version, ConnectionStates0).
+send(Transport, {Listener, Socket}, Data) when is_pid(Listener) -> % Server socket
+    dtls_socket:send(Transport, Socket, Data);
+send(Transport, Socket, Data) -> % Client socket
+    dtls_socket:send(Transport, Socket, Data).
 
-passive_receive(State0 = #state{user_data_buffer = Buffer}, StateName) ->
-    case Buffer of
-	<<>> ->
-	    {Record, State} = next_record(State0),
-	    next_event(StateName, Record, State);
-	_ ->
-	    {Record, State} = ssl_connection:read_application_data(<<>>, State0),
-	    next_event(StateName, Record, State)
-    end.
-next_record_if_active(State =
-		      #state{socket_options =
-			     #socket_options{active = false}}) ->
-    {no_record ,State};
-
-next_record_if_active(State) ->
-    next_record(State).
-
-send(Transport, {_, {{_,_}, _} = Socket}, Data) ->
-    send(Transport, Socket, Data);
-send(Transport, Socket, Data) ->
-   dtls_socket:send(Transport, Socket, Data).
-
-socket(Pid,  Transport, Socket, Connection, _) ->
-    dtls_socket:socket(Pid, Transport, Socket, Connection).
+socket(Pid,  Transport, Socket, _Tracker) ->
+    dtls_socket:socket(Pid, Transport, Socket, ?MODULE).
 
 setopts(Transport, Socket, Other) ->
     dtls_socket:setopts(Transport, Socket, Other).
@@ -435,44 +416,39 @@ getopts(Transport, Socket, Tag) ->
 init(enter, _, State) ->
     {keep_state, State};     
 init({call, From}, {start, Timeout}, 
-     #state{host = Host, port = Port, role = client,
+     #state{static_env = #static_env{host = Host,
+                                     port = Port,
+                                     role = client,
+                                     session_cache = Cache,
+                                     session_cache_cb = CacheCb},
+            handshake_env = #handshake_env{renegotiation = {Renegotiation, _}},
+            connection_env = CEnv,
 	    ssl_options = SslOpts,
 	    session = #session{own_certificate = Cert} = Session0,
-	    connection_states = ConnectionStates0,
-	    renegotiation = {Renegotiation, _},
-	    session_cache = Cache,
-	    session_cache_cb = CacheCb
+	    connection_states = ConnectionStates0
 	   } = State0) ->
-    Timer = ssl_connection:start_or_recv_cancel_timer(Timeout, From),
     Hello = dtls_handshake:client_hello(Host, Port, ConnectionStates0, SslOpts,
 					Cache, CacheCb, Renegotiation, Cert),
 
     Version = Hello#client_hello.client_version,
     HelloVersion = dtls_record:hello_version(Version, SslOpts#ssl_options.versions),
-    State1 = prepare_flight(State0#state{negotiated_version = Version}),
-    {State2, Actions} = send_handshake(Hello, State1#state{negotiated_version = HelloVersion}),  
-    State3 = State2#state{negotiated_version = Version, %% Requested version
+    State1 = prepare_flight(State0#state{connection_env = CEnv#connection_env{negotiated_version = Version}}),
+    {State2, Actions} = send_handshake(Hello, State1#state{connection_env = CEnv#connection_env{negotiated_version = HelloVersion}}),  
+    State3 = State2#state{connection_env = CEnv#connection_env{negotiated_version = Version}, %% RequestedVersion
 			  session =
 			      Session0#session{session_id = Hello#client_hello.session_id},
-			  start_or_recv_from = From,
-			  timer = Timer,
-                          flight_state = {retransmit, ?INITIAL_RETRANSMIT_TIMEOUT}
-                         },
+			  start_or_recv_from = From},
     {Record, State} = next_record(State3),
-    next_event(hello, Record, State, Actions);
-init({call, _} = Type, Event, #state{role = server, data_tag = udp} = State) ->
+    next_event(hello, Record, State, [{{timeout, handshake}, Timeout, close} | Actions]);
+init({call, _} = Type, Event, #state{static_env = #static_env{role = server},
+                                     protocol_specific = PS} = State) ->
     Result = gen_handshake(?FUNCTION_NAME, Type, Event, 
-                           State#state{flight_state = {retransmit, ?INITIAL_RETRANSMIT_TIMEOUT},
-                                       protocol_specific = #{current_cookie_secret => dtls_v1:cookie_secret(), 
-                                                             previous_cookie_secret => <<>>,
-                                                             ignored_alerts => 0,
-                                                             max_ignored_alerts => 10}}),
+                           State#state{protocol_specific = PS#{current_cookie_secret => dtls_v1:cookie_secret(), 
+                                                               previous_cookie_secret => <<>>,
+                                                               ignored_alerts => 0,
+                                                               max_ignored_alerts => 10}}),
     erlang:send_after(dtls_v1:cookie_timeout(), self(), new_cookie_secret),
     Result;
-
-init({call, _} = Type, Event, #state{role = server} = State) ->
-    %% I.E. DTLS over sctp
-    gen_handshake(?FUNCTION_NAME, Type, Event, State#state{flight_state = reliable});
 init(Type, Event, State) ->
    gen_handshake(?FUNCTION_NAME, Type, Event, State).
 
@@ -485,8 +461,8 @@ error(enter, _, State) ->
     {keep_state, State};     
 error({call, From}, {start, _Timeout}, 
       #state{protocol_specific = #{error := Error}} = State) ->
-    ssl_connection:stop_and_reply(
-      normal, {reply, From, {error, Error}}, State);
+    {stop_and_reply, {shutdown, normal}, 
+     [{reply, From, {error, Error}}], State};
 error({call, _} = Call, Msg, State) ->
     gen_handshake(?FUNCTION_NAME, Call, Msg, State);
 error(_, _, _) ->
@@ -498,16 +474,18 @@ error(_, _, _) ->
 	    #state{}) ->
 		   gen_statem:state_function_result().
 %%--------------------------------------------------------------------
-hello(enter, _, #state{role = server} = State) ->
+hello(enter, _, #state{static_env = #static_env{role = server}} = State) ->
     {keep_state, State};     
-hello(enter, _, #state{role = client} = State0) ->
+hello(enter, _, #state{static_env = #static_env{role = client}} = State0) ->
     {State, Actions} = handle_flight_timer(State0),
     {keep_state, State, Actions}; 
 hello(internal, #client_hello{cookie = <<>>,
 			      client_version = Version} = Hello, 
-      #state{role = server,
-             transport_cb = Transport,
-             socket = Socket,
+      #state{static_env = #static_env{role = server,
+                                      transport_cb = Transport,
+                                      socket = Socket},
+             handshake_env = HsEnv,
+             connection_env = CEnv,
              protocol_specific = #{current_cookie_secret := Secret}} = State0) ->
     {ok, {IP, Port}} = dtls_socket:peername(Transport, Socket),
     Cookie = dtls_handshake:cookie(Secret, IP, Port, Hello),
@@ -518,49 +496,62 @@ hello(internal, #client_hello{cookie = <<>>,
     %% version 1.0 regardless of the version of TLS that is expected to be
     %% negotiated.
     VerifyRequest = dtls_handshake:hello_verify_request(Cookie, ?HELLO_VERIFY_REQUEST_VERSION),
-    State1 = prepare_flight(State0#state{negotiated_version = Version}),
+    State1 = prepare_flight(State0#state{connection_env = CEnv#connection_env{negotiated_version = Version}}),
     {State2, Actions} = send_handshake(VerifyRequest, State1),
     {Record, State} = next_record(State2),
-    next_event(?FUNCTION_NAME, Record, State#state{tls_handshake_history = ssl_handshake:init_handshake_history()}, Actions);
-hello(internal, #hello_verify_request{cookie = Cookie}, #state{role = client,
-							       host = Host, port = Port, 
+    next_event(?FUNCTION_NAME, Record, 
+               State#state{handshake_env = HsEnv#handshake_env{
+                                             tls_handshake_history = 
+                                                 ssl_handshake:init_handshake_history()}}, 
+               Actions);
+hello(internal, #hello_verify_request{cookie = Cookie}, #state{static_env = #static_env{role = client,
+                                                                                        host = Host,
+                                                                                        port = Port,
+                                                                                        session_cache = Cache,
+                                                                                        session_cache_cb = CacheCb},
+                                                               handshake_env = #handshake_env{renegotiation = {Renegotiation, _}} = HsEnv,
+                                                               connection_env = CEnv,
 							       ssl_options = SslOpts,
 							       session = #session{own_certificate = OwnCert} 
 							       = Session0,
-							       connection_states = ConnectionStates0,
-							       renegotiation = {Renegotiation, _},
-							       session_cache = Cache,
-							       session_cache_cb = CacheCb
+							       connection_states = ConnectionStates0
 							      } = State0) ->
   
     Hello = dtls_handshake:client_hello(Host, Port, Cookie, ConnectionStates0,
 					SslOpts,
 					Cache, CacheCb, Renegotiation, OwnCert),
     Version = Hello#client_hello.client_version,
-    State1 = prepare_flight(State0#state{tls_handshake_history = ssl_handshake:init_handshake_history()}),
+    State1 = prepare_flight(State0#state{handshake_env =  
+                                             HsEnv#handshake_env{tls_handshake_history 
+                                                                 = ssl_handshake:init_handshake_history()}}),
     
     {State2, Actions} = send_handshake(Hello, State1), 
-    State3 = State2#state{negotiated_version = Version, %% Requested version
-			  session =
-			      Session0#session{session_id = 
-						   Hello#client_hello.session_id}},
-    {Record, State} = next_record(State3),
-    next_event(?FUNCTION_NAME, Record, State, Actions);
-hello(internal, #client_hello{extensions = Extensions} = Hello, #state{ssl_options = #ssl_options{handshake = hello},
-                                                                       start_or_recv_from = From} = State) ->
+    State = State2#state{connection_env = CEnv#connection_env{negotiated_version = Version}, %% Requested version
+                         session =
+                             Session0#session{session_id = 
+                                                  Hello#client_hello.session_id}},
+    next_event(?FUNCTION_NAME, no_record, State, Actions);
+hello(internal, #client_hello{extensions = Extensions} = Hello, 
+      #state{ssl_options = #ssl_options{handshake = hello},
+             handshake_env = HsEnv,
+             start_or_recv_from = From} = State) ->
     {next_state, user_hello, State#state{start_or_recv_from = undefined,
-                                             hello = Hello},
+                                         handshake_env = HsEnv#handshake_env{hello = Hello}},
      [{reply, From, {ok, ssl_connection:map_extensions(Extensions)}}]};
-hello(internal, #server_hello{extensions = Extensions} = Hello, #state{ssl_options = #ssl_options{handshake = hello},
-                                                                       start_or_recv_from = From} = State) ->
+hello(internal, #server_hello{extensions = Extensions} = Hello, 
+      #state{ssl_options = #ssl_options{handshake = hello},
+             handshake_env = HsEnv,
+             start_or_recv_from = From} = State) ->
     {next_state, user_hello, State#state{start_or_recv_from = undefined,
-                                             hello = Hello},
+                                         handshake_env = HsEnv#handshake_env{hello = Hello}},    
      [{reply, From, {ok, ssl_connection:map_extensions(Extensions)}}]};     
-hello(internal, #client_hello{cookie = Cookie} = Hello, #state{role = server,
-							       transport_cb = Transport,
-							       socket = Socket,
+
+hello(internal, #client_hello{cookie = Cookie} = Hello, #state{static_env = #static_env{role = server,
+                                                                                        transport_cb = Transport,
+                                                                                        socket = Socket},
                                                                protocol_specific = #{current_cookie_secret := Secret,
-                                                                                     previous_cookie_secret := PSecret}} = State0) ->
+                                                                                     previous_cookie_secret := PSecret}
+                                                              } = State0) ->
     {ok, {IP, Port}} = dtls_socket:peername(Transport, Socket),
     case dtls_handshake:cookie(Secret, IP, Port, Hello) of
 	Cookie ->
@@ -575,11 +566,12 @@ hello(internal, #client_hello{cookie = Cookie} = Hello, #state{role = server,
             end
     end;
 hello(internal, #server_hello{} = Hello,
-      #state{connection_states = ConnectionStates0,
-	     negotiated_version = ReqVersion,
-	     role = client,
-	     renegotiation = {Renegotiation, _},
-	     ssl_options = SslOptions} = State) ->
+      #state{
+         static_env = #static_env{role = client},
+         handshake_env = #handshake_env{renegotiation = {Renegotiation, _}},
+         connection_env = #connection_env{negotiated_version = ReqVersion},
+         connection_states = ConnectionStates0,
+         ssl_options = SslOptions} = State) ->
     case dtls_handshake:hello(Hello, SslOptions, ConnectionStates0, Renegotiation) of
 	#alert{} = Alert ->
 	    handle_own_alert(Alert, ReqVersion, ?FUNCTION_NAME, State);
@@ -595,8 +587,7 @@ hello(internal, {handshake, {#hello_verify_request{} = Handshake, _}}, State) ->
     {next_state, ?FUNCTION_NAME, State, [{next_event, internal, Handshake}]};
 hello(internal,  #change_cipher_spec{type = <<1>>}, State0) ->
     {State1, Actions0} = send_handshake_flight(State0, retransmit_epoch(?FUNCTION_NAME, State0)),
-    {Record, State2} = next_record(State1),
-    {next_state, ?FUNCTION_NAME, State, Actions} = next_event(?FUNCTION_NAME, Record, State2, Actions0),
+    {next_state, ?FUNCTION_NAME, State, Actions} = next_event(?FUNCTION_NAME, no_record, State1, Actions0),
     %% This will reset the retransmission timer by repeating the enter state event
     {repeat_state, State, Actions};
 hello(info, Event, State) ->
@@ -626,10 +617,11 @@ abbreviated(internal = Type,
     ConnectionStates1 = dtls_record:save_current_connection_state(ConnectionStates0, read),
     ConnectionStates = dtls_record:next_epoch(ConnectionStates1, read),
     gen_handshake(?FUNCTION_NAME, Type, Event, State#state{connection_states = ConnectionStates});
-abbreviated(internal = Type, #finished{} = Event, #state{connection_states = ConnectionStates} = State) ->
+abbreviated(internal = Type, #finished{} = Event, #state{connection_states = ConnectionStates,
+                                                         protocol_specific = PS} = State) ->
     gen_handshake(?FUNCTION_NAME, Type, Event, 
                   prepare_flight(State#state{connection_states = ConnectionStates,
-                                             flight_state = connection}));
+                                             protocol_specific = PS#{flight_state => connection}}));
 abbreviated(state_timeout, Event, State) ->
     handle_state_timeout(Event, ?FUNCTION_NAME, State);
 abbreviated(Type, Event, State) ->
@@ -647,8 +639,7 @@ certify(internal = Type, #server_hello_done{} = Event, State) ->
     ssl_connection:certify(Type, Event, prepare_flight(State), ?MODULE);
 certify(internal,  #change_cipher_spec{type = <<1>>}, State0) ->
     {State1, Actions0} = send_handshake_flight(State0, retransmit_epoch(?FUNCTION_NAME, State0)),
-    {Record, State2} = next_record(State1),
-    {next_state, ?FUNCTION_NAME, State, Actions} = next_event(?FUNCTION_NAME, Record, State2, Actions0),
+    {next_state, ?FUNCTION_NAME, State, Actions} = next_event(?FUNCTION_NAME, no_record, State1, Actions0),
     %% This will reset the retransmission timer by repeating the enter state event
     {repeat_state, State, Actions};
 certify(state_timeout, Event, State) ->
@@ -670,10 +661,11 @@ cipher(internal = Type, #change_cipher_spec{type = <<1>>} = Event,
     ConnectionStates1 = dtls_record:save_current_connection_state(ConnectionStates0, read),
     ConnectionStates = dtls_record:next_epoch(ConnectionStates1, read),
     ssl_connection:?FUNCTION_NAME(Type, Event, State#state{connection_states = ConnectionStates}, ?MODULE);
-cipher(internal = Type, #finished{} = Event, #state{connection_states = ConnectionStates} = State) ->
+cipher(internal = Type, #finished{} = Event, #state{connection_states = ConnectionStates,
+                                                   protocol_specific = PS} = State) ->
     ssl_connection:?FUNCTION_NAME(Type, Event, 
                                   prepare_flight(State#state{connection_states = ConnectionStates,
-                                                             flight_state = connection}), 
+                                                             protocol_specific = PS#{flight_state => connection}}), 
                                   ?MODULE);
 cipher(state_timeout, Event, State) ->
     handle_state_timeout(Event, ?FUNCTION_NAME, State);
@@ -689,35 +681,45 @@ connection(enter, _, State) ->
     {keep_state, State};     
 connection(info, Event, State) ->
     gen_info(Event, ?FUNCTION_NAME, State);
-connection(internal, #hello_request{}, #state{host = Host, port = Port,
+connection(internal, #hello_request{}, #state{static_env = #static_env{host = Host,
+                                                                       port = Port,
+                                                                       data_tag = DataTag,
+                                                                       session_cache = Cache,
+                                                                       session_cache_cb = CacheCb
+                                                                      },
+                                              handshake_env = #handshake_env{ renegotiation = {Renegotiation, _}},
+                                              connection_env = CEnv,
                                               session = #session{own_certificate = Cert} = Session0,
-                                              session_cache = Cache, session_cache_cb = CacheCb,
                                               ssl_options = SslOpts,
                                               connection_states = ConnectionStates0,
-                                              renegotiation = {Renegotiation, _}} = State0) ->
+                                              protocol_specific = PS
+                                             } = State0) ->
     
     Hello = dtls_handshake:client_hello(Host, Port, ConnectionStates0, SslOpts,
 					Cache, CacheCb, Renegotiation, Cert),
     Version = Hello#client_hello.client_version,
     HelloVersion = dtls_record:hello_version(Version, SslOpts#ssl_options.versions),
     State1 = prepare_flight(State0),
-    {State2, Actions} = send_handshake(Hello, State1#state{negotiated_version = HelloVersion}),
+    {State2, Actions} = send_handshake(Hello, State1#state{connection_env = CEnv#connection_env{negotiated_version = HelloVersion}}),
     {Record, State} =
 	next_record(
-	  State2#state{flight_state = {retransmit, ?INITIAL_RETRANSMIT_TIMEOUT},
+	  State2#state{protocol_specific = PS#{flight_state => initial_flight_state(DataTag)},
                        session = Session0#session{session_id
-						  = Hello#client_hello.session_id}}),
+                                                  = Hello#client_hello.session_id}}),
     next_event(hello, Record, State, Actions);
-connection(internal, #client_hello{} = Hello, #state{role = server, allow_renegotiate = true} = State) ->
+connection(internal, #client_hello{} = Hello, #state{static_env = #static_env{role = server},
+                                                     handshake_env = #handshake_env{allow_renegotiate = true} = HsEnv} = State) ->
     %% Mitigate Computational DoS attack
     %% http://www.educatedguesswork.org/2011/10/ssltls_and_computational_dos.html
     %% http://www.thc.org/thc-ssl-dos/ Rather than disabling client
     %% initiated renegotiation we will disallow many client initiated
     %% renegotiations immediately after each other.
     erlang:send_after(?WAIT_TO_ALLOW_RENEGOTIATION, self(), allow_renegotiate),
-    {next_state, hello, State#state{allow_renegotiate = false, renegotiation = {true, peer}},
+    {next_state, hello, State#state{handshake_env = HsEnv#handshake_env{renegotiation = {true, peer},
+                                                                        allow_renegotiate = false}},
      [{next_event, internal, Hello}]};
-connection(internal, #client_hello{}, #state{role = server, allow_renegotiate = false} = State0) ->
+connection(internal, #client_hello{}, #state{static_env = #static_env{role = server},
+                                             handshake_env = #handshake_env{allow_renegotiate = false}} = State0) ->
     Alert = ?ALERT_REC(?WARNING, ?NO_RENEGOTIATION),
     State1 = send_alert(Alert, State0),
     {Record, State} = ssl_connection:prepare_connection(State1, ?MODULE),
@@ -772,32 +774,43 @@ initial_state(Role, Host, Port, Socket, {SSLOptions, SocketOptions, _}, User,
 		     end,
     
     Monitor = erlang:monitor(process, User),
+    InitStatEnv = #static_env{
+                     role = Role,
+                     transport_cb = CbModule,
+                     protocol_cb = ?MODULE,
+                     data_tag = DataTag,
+                     close_tag = CloseTag,
+                     error_tag = ErrorTag,
+                     host = Host,
+                     port = Port,
+                     socket = Socket,
+                     session_cache_cb = SessionCacheCb
+                    },
 
-    #state{socket_options = SocketOptions,
+    #state{static_env = InitStatEnv,
+           handshake_env = #handshake_env{
+                              tls_handshake_history = ssl_handshake:init_handshake_history(),
+                              renegotiation = {false, first},
+                              allow_renegotiate = SSLOptions#ssl_options.client_renegotiation
+                             },
+           connection_env = #connection_env{user_application = {Monitor, User}},
+           socket_options = SocketOptions,
 	   %% We do not want to save the password in the state so that
 	   %% could be written in the clear into error logs.
 	   ssl_options = SSLOptions#ssl_options{password = undefined},	   
 	   session = #session{is_resumable = new},
-	   transport_cb = CbModule,
-	   data_tag = DataTag,
-	   close_tag = CloseTag,
-	   error_tag = ErrorTag,
-	   role = Role,
-	   host = Host,
-	   port = Port,
-	   socket = Socket,
 	   connection_states = ConnectionStates,
 	   protocol_buffers = #protocol_buffers{},
-	   user_application = {Monitor, User},
-	   user_data_buffer = <<>>,
-	   session_cache_cb = SessionCacheCb,
-	   renegotiation = {false, first},
-	   allow_renegotiate = SSLOptions#ssl_options.client_renegotiation,
+	   user_data_buffer = {[],0,[]},
 	   start_or_recv_from = undefined,
-	   protocol_cb = ?MODULE,
 	   flight_buffer = new_flight(),
-           flight_state = {retransmit, ?INITIAL_RETRANSMIT_TIMEOUT}
+           protocol_specific = #{flight_state => initial_flight_state(DataTag)}
 	  }.
+
+initial_flight_state(udp)->
+    {retransmit, ?INITIAL_RETRANSMIT_TIMEOUT};
+initial_flight_state(_) ->
+    reliable.
 
 next_dtls_record(Data, StateName, #state{protocol_buffers = #protocol_buffers{
 						   dtls_record_buffer = Buf0,
@@ -816,7 +829,7 @@ next_dtls_record(Data, StateName, #state{protocol_buffers = #protocol_buffers{
 
 acceptable_record_versions(hello, _) ->
     [dtls_record:protocol_version(Vsn) || Vsn <- ?ALL_DATAGRAM_SUPPORTED_VERSIONS];
-acceptable_record_versions(_, #state{negotiated_version = Version}) ->
+acceptable_record_versions(_, #state{connection_env = #connection_env{negotiated_version = Version}}) ->
     [Version].
 
 dtls_handshake_events(Packets) ->
@@ -835,19 +848,22 @@ decode_cipher_text(#state{protocol_buffers = #protocol_buffers{dtls_cipher_texts
 	    {Alert, State}
     end.
 
-dtls_version(hello, Version, #state{role = server} = State) ->
-    State#state{negotiated_version = Version}; %%Inital version
+dtls_version(hello, Version, #state{static_env = #static_env{role = server},
+                                    connection_env = CEnv} = State) ->
+    State#state{connection_env = CEnv#connection_env{negotiated_version = Version}}; %%Inital version
 dtls_version(_,_, State) ->
     State.
 
 handle_client_hello(#client_hello{client_version = ClientVersion} = Hello,
 		    #state{connection_states = ConnectionStates0,
-			   port = Port, session = #session{own_certificate = Cert} = Session0,
-			   renegotiation = {Renegotiation, _},
-			   session_cache = Cache,
-			   session_cache_cb = CacheCb,
-			   negotiated_protocol = CurrentProtocol,
-			   key_algorithm = KeyExAlg,
+                           static_env = #static_env{port = Port,
+                                                     session_cache = Cache,
+                                                    session_cache_cb = CacheCb},
+                           handshake_env = #handshake_env{kex_algorithm = KeyExAlg,
+                                                          renegotiation = {Renegotiation, _},
+                                                          negotiated_protocol = CurrentProtocol} = HsEnv,
+                           connection_env = CEnv,
+			   session = #session{own_certificate = Cert} = Session0,
 			   ssl_options = SslOpts} = State0) ->
     
     case dtls_handshake:hello(Hello, SslOpts, {Port, Session0, Cache, CacheCb,
@@ -862,11 +878,12 @@ handle_client_hello(#client_hello{client_version = ClientVersion} = Hello,
 		       end,
 
 	    State = prepare_flight(State0#state{connection_states = ConnectionStates,
-						negotiated_version = Version,
-						hashsign_algorithm = HashSign,
-                                                client_hello_version = ClientVersion,
-						session = Session,
-						negotiated_protocol = Protocol}),
+						connection_env = CEnv#connection_env{negotiated_version = Version},
+                                                handshake_env = HsEnv#handshake_env{
+                                                                  hashsign_algorithm = HashSign,
+                                                                  client_hello_version = ClientVersion,
+                                                                  negotiated_protocol = Protocol},
+						session = Session}),
 	    
 	    ssl_connection:hello(internal, {common_client_hello, Type, ServerHelloExt},
 				 State, ?MODULE)
@@ -875,20 +892,20 @@ handle_client_hello(#client_hello{client_version = ClientVersion} = Hello,
 
 %% raw data from socket, unpack records
 handle_info({Protocol, _, _, _, Data}, StateName,
-            #state{data_tag = Protocol} = State0) ->
+            #state{static_env = #static_env{data_tag = Protocol}} = State0) ->
     case next_dtls_record(Data, StateName, State0) of
 	{Record, State} ->
 	    next_event(StateName, Record, State);
 	#alert{} = Alert ->
 	    ssl_connection:handle_normal_shutdown(Alert, StateName, State0), 
-	    ssl_connection:stop({shutdown, own_alert}, State0)
+            {stop, {shutdown, own_alert}, State0}
     end;
 handle_info({CloseTag, Socket}, StateName,
-	    #state{socket = Socket, 
+	    #state{static_env = #static_env{socket = Socket,
+                                            close_tag = CloseTag},
+                   connection_env = #connection_env{negotiated_version = Version},
                    socket_options = #socket_options{active = Active},
-                   protocol_buffers = #protocol_buffers{dtls_cipher_texts = CTs},
-                   close_tag = CloseTag,
-		   negotiated_version = Version} = State) ->
+                   protocol_buffers = #protocol_buffers{dtls_cipher_texts = CTs}} = State) ->
     %% Note that as of DTLS 1.2 (TLS 1.1),
     %% failure to properly close a connection no longer requires that a
     %% session not be resumed.	This is a change from DTLS 1.0 to conform
@@ -906,7 +923,7 @@ handle_info({CloseTag, Socket}, StateName,
                     ok
             end,
             ssl_connection:handle_normal_shutdown(?ALERT_REC(?FATAL, ?CLOSE_NOTIFY), StateName, State),
-            ssl_connection:stop({shutdown, transport_closed}, State);
+            {stop, {shutdown, transport_closed}, State};
         true ->
             %% Fixes non-delivery of final DTLS record in {active, once}.
             %% Basically allows the application the opportunity to set {active, once} again
@@ -924,11 +941,11 @@ handle_info(Msg, StateName, State) ->
     ssl_connection:StateName(info, Msg, State, ?MODULE).
 
 handle_state_timeout(flight_retransmission_timeout, StateName,
-                     #state{flight_state = {retransmit, NextTimeout}} = State0) ->
-    {State1, Actions0} = send_handshake_flight(State0#state{flight_state = {retransmit, NextTimeout}}, 
-                                              retransmit_epoch(StateName, State0)),
-    {Record, State2} = next_record(State1),
-    {next_state, StateName, State, Actions} = next_event(StateName, Record, State2, Actions0),
+                     #state{protocol_specific = 
+                                #{flight_state := {retransmit, _NextTimeout}}} = State0) ->
+    {State1, Actions0} = send_handshake_flight(State0, 
+                                               retransmit_epoch(StateName, State0)),
+    {next_state, StateName, State, Actions} = next_event(StateName, no_record, State1, Actions0),
     %% This will reset the retransmission timer by repeating the enter state event
     {repeat_state, State, Actions}.
 
@@ -941,8 +958,8 @@ handle_alerts([Alert | Alerts], {next_state, StateName, State}) ->
 handle_alerts([Alert | Alerts], {next_state, StateName, State, _Actions}) ->
      handle_alerts(Alerts, ssl_connection:handle_alert(Alert, StateName, State)).
 
-handle_own_alert(Alert, Version, StateName, #state{data_tag = udp,
-                                                   role = Role,
+handle_own_alert(Alert, Version, StateName, #state{static_env = #static_env{data_tag = udp,
+                                                                            role = Role},
                                                    ssl_options = Options} = State0) ->
     case ignore_alert(Alert, State0) of
         {true, State} ->
@@ -967,7 +984,7 @@ decode_alerts(Bin) ->
     ssl_alert:decode(Bin).
 
 gen_handshake(StateName, Type, Event, 
-	      #state{negotiated_version = Version} = State) ->
+	      #state{connection_env = #connection_env{negotiated_version = Version}} = State) ->
     try ssl_connection:StateName(Type, Event, State, ?MODULE) of
 	Result ->
 	    Result
@@ -978,7 +995,7 @@ gen_handshake(StateName, Type, Event,
 					    Version, StateName, State)  
     end.
 
-gen_info(Event, connection = StateName,  #state{negotiated_version = Version} = State) ->
+gen_info(Event, connection = StateName,  #state{connection_env = #connection_env{negotiated_version = Version}} = State) ->
     try handle_info(Event, StateName, State) of
 	Result ->
 	    Result
@@ -989,7 +1006,7 @@ gen_info(Event, connection = StateName,  #state{negotiated_version = Version} = 
 					    Version, StateName, State)  
     end;
 
-gen_info(Event, StateName, #state{negotiated_version = Version} = State) ->
+gen_info(Event, StateName, #state{connection_env = #connection_env{negotiated_version = Version}} = State) ->
     try handle_info(Event, StateName, State) of
 	Result ->
 	    Result
@@ -1032,18 +1049,18 @@ next_flight(Flight) ->
 	    change_cipher_spec => undefined,
 	    handshakes_after_change_cipher_spec => []}.
        
-handle_flight_timer(#state{data_tag = udp,
-                          flight_state = {retransmit, Timeout}} = State) ->
+handle_flight_timer(#state{static_env = #static_env{data_tag = udp},
+                           protocol_specific = #{flight_state := {retransmit, Timeout}}} = State) ->
     start_retransmision_timer(Timeout, State);
-handle_flight_timer(#state{data_tag = udp,
-		    flight_state = connection} = State) ->
+handle_flight_timer(#state{static_env = #static_env{data_tag = udp},
+                           protocol_specific = #{flight_state := connection}} = State) ->
     {State, []};
-handle_flight_timer(State) ->
+handle_flight_timer(#state{protocol_specific = #{flight_state := reliable}} = State) ->
     %% No retransmision needed i.e DTLS over SCTP
-    {State#state{flight_state = reliable}, []}.
+    {State, []}.
 
-start_retransmision_timer(Timeout, State) ->
-    {State#state{flight_state = {retransmit, new_timeout(Timeout)}}, 
+start_retransmision_timer(Timeout, #state{protocol_specific = PS} = State) ->
+    {State#state{protocol_specific = PS#{flight_state => {retransmit, new_timeout(Timeout)}}}, 
      [{state_timeout, Timeout, flight_retransmission_timeout}]}.
 
 new_timeout(N) when N =< 30 -> 
@@ -1051,11 +1068,11 @@ new_timeout(N) when N =< 30 ->
 new_timeout(_) -> 
     60.
 
-send_handshake_flight(#state{socket = Socket,
-			     transport_cb = Transport,
-			     flight_buffer = #{handshakes := Flight,
+send_handshake_flight(#state{static_env = #static_env{socket = Socket,
+                                                      transport_cb = Transport},
+                             connection_env = #connection_env{negotiated_version = Version},
+                             flight_buffer = #{handshakes := Flight,
 					       change_cipher_spec := undefined},
-			     negotiated_version = Version,
 			     connection_states = ConnectionStates0} = State0, Epoch) ->
     %% TODO remove hardcoded Max size
     {Encoded, ConnectionStates} =
@@ -1063,12 +1080,12 @@ send_handshake_flight(#state{socket = Socket,
     send(Transport, Socket, Encoded), 
    {State0#state{connection_states = ConnectionStates}, []};
 
-send_handshake_flight(#state{socket = Socket,
-			     transport_cb = Transport,
+send_handshake_flight(#state{static_env = #static_env{socket = Socket,
+                                                      transport_cb = Transport},
+                             connection_env = #connection_env{negotiated_version = Version},
 			     flight_buffer = #{handshakes := [_|_] = Flight0,
 					       change_cipher_spec := ChangeCipher,
 					       handshakes_after_change_cipher_spec := []},
-			     negotiated_version = Version,
 			     connection_states = ConnectionStates0} = State0, Epoch) ->      
     {HsBefore, ConnectionStates1} =
 	encode_handshake_flight(lists:reverse(Flight0), Version, 1400, Epoch, ConnectionStates0),
@@ -1077,12 +1094,12 @@ send_handshake_flight(#state{socket = Socket,
     send(Transport, Socket, [HsBefore, EncChangeCipher]),
     {State0#state{connection_states = ConnectionStates}, []};
 
-send_handshake_flight(#state{socket = Socket,
-			     transport_cb = Transport,
+send_handshake_flight(#state{static_env = #static_env{socket = Socket,
+                                                      transport_cb = Transport},
+                             connection_env = #connection_env{negotiated_version = Version},
 			     flight_buffer = #{handshakes := [_|_] = Flight0,
 					       change_cipher_spec := ChangeCipher,
 					       handshakes_after_change_cipher_spec := Flight1},
-			     negotiated_version = Version,
 			     connection_states = ConnectionStates0} = State0, Epoch) ->      
     {HsBefore, ConnectionStates1} =
 	encode_handshake_flight(lists:reverse(Flight0), Version, 1400, Epoch-1, ConnectionStates0),
@@ -1093,12 +1110,12 @@ send_handshake_flight(#state{socket = Socket,
     send(Transport, Socket, [HsBefore, EncChangeCipher, HsAfter]),
     {State0#state{connection_states = ConnectionStates}, []};
 
-send_handshake_flight(#state{socket = Socket,
-			     transport_cb = Transport,
+send_handshake_flight(#state{static_env = #static_env{socket = Socket,
+                                                      transport_cb = Transport},
+                             connection_env = #connection_env{negotiated_version = Version},
 			     flight_buffer = #{handshakes := [],
 					       change_cipher_spec := ChangeCipher,
 					       handshakes_after_change_cipher_spec := Flight1},
-			     negotiated_version = Version,
 			     connection_states = ConnectionStates0} = State0, Epoch) ->
     {EncChangeCipher, ConnectionStates1} = 
 	encode_change_cipher(ChangeCipher, Version, Epoch-1, ConnectionStates0),
@@ -1151,22 +1168,22 @@ log_ignore_alert(false, _, _,_) ->
     ok.
 
 send_application_data(Data, From, _StateName,
-                      #state{socket = Socket,
-                             negotiated_version = Version,
-                             protocol_cb = Connection,
-                             transport_cb = Transport,
+                      #state{static_env = #static_env{socket = Socket,
+                                                      transport_cb = Transport},
+                             connection_env = #connection_env{negotiated_version = Version},
+                             handshake_env = HsEnv,
                              connection_states = ConnectionStates0,
                              ssl_options = #ssl_options{renegotiate_at = RenegotiateAt}} = State0) ->
        
     case time_to_renegotiate(Data, ConnectionStates0, RenegotiateAt) of
 	true ->
-	    renegotiate(State0#state{renegotiation = {true, internal}}, 
+	    renegotiate(State0#state{handshake_env = HsEnv#handshake_env{renegotiation = {true, internal}}}, 
                         [{next_event, {call, From}, {application_data, Data}}]);
 	false ->
 	    {Msgs, ConnectionStates} =
-                Connection:encode_data(Data, Version, ConnectionStates0),
+                dtls_record:encode_data(Data, Version, ConnectionStates0),
             State = State0#state{connection_states = ConnectionStates},
-	    case Connection:send(Transport, Socket, Msgs) of
+	    case send(Transport, Socket, Msgs) of
                 ok ->
                     ssl_connection:hibernate_after(connection, State, [{reply, From, ok}]);
                 Result ->
@@ -1188,3 +1205,4 @@ is_time_to_renegotiate(N, M) when N < M->
     false;
 is_time_to_renegotiate(_,_) ->
     true.
+

@@ -113,6 +113,9 @@ extern Eterm erts_bld_resource_ref(Eterm** hp, ErlOffHeap*, ErtsResource*);
 extern void erts_pre_nif(struct enif_environment_t*, Process*,
 			 struct erl_module_nif*, Process* tracee);
 extern void erts_post_nif(struct enif_environment_t* env);
+#ifdef DEBUG
+int erts_dbg_is_resource_dying(ErtsResource*);
+#endif
 extern void erts_resource_stop(ErtsResource*, ErlNifEvent, int is_direct_call);
 void erts_fire_nif_monitor(ErtsMonitor *tmon);
 void erts_nif_demonitored(ErtsResource* resource);
@@ -906,6 +909,8 @@ typedef struct ErtsLiteralArea_ {
     Eterm start[1]; /* beginning of area */
 } ErtsLiteralArea;
 
+void erts_queue_release_literals(Process *c_p, ErtsLiteralArea* literals);
+
 #define ERTS_LITERAL_AREA_ALLOC_SIZE(N) \
     (sizeof(ErtsLiteralArea) + sizeof(Eterm)*((N) - 1))
 
@@ -960,7 +965,7 @@ void init_break_handler(void);
 void erts_set_ignore_break(void);
 void erts_replace_intr(void);
 void process_info(fmtfn_t, void *);
-void print_process_info(fmtfn_t, void *, Process*);
+void print_process_info(fmtfn_t, void *, Process*, ErtsProcLocks);
 void info(fmtfn_t, void *);
 void loaded(fmtfn_t, void *);
 void erts_print_base64(fmtfn_t to, void *to_arg, byte* src, Uint size);
@@ -1001,6 +1006,7 @@ typedef struct {
     Uint literal_size;
     Eterm *lit_purge_ptr;
     Uint lit_purge_sz;
+    int copy_literals;
 } erts_shcopy_t;
 
 #define INITIALIZE_SHCOPY(info)						\
@@ -1010,6 +1016,7 @@ typedef struct {
 	info.bitstore_start = info.bitstore_default;			\
 	info.shtable_start = info.shtable_default;			\
 	info.literal_size = 0;						\
+	info.copy_literals = 0;						\
 	if (larea__) {							\
 	    info.lit_purge_ptr = &larea__->start[0];			\
 	    info.lit_purge_sz = larea__->end - info.lit_purge_ptr;	\
@@ -1238,6 +1245,13 @@ Sint erts_re_set_loop_limit(Sint limit);
 void erts_init_bif_binary(void);
 Sint erts_binary_set_loop_limit(Sint limit);
 
+/* erl_bif_persistent.c */
+void erts_init_bif_persistent_term(void);
+Uint erts_persistent_term_count(void);
+void erts_init_persistent_dumping(void);
+extern ErtsLiteralArea** erts_persistent_areas;
+extern Uint erts_num_persistent_areas;
+
 /* external.c */
 void erts_init_external(void);
 
@@ -1292,14 +1306,7 @@ Sint intlist_to_buf(Eterm, char*, Sint); /* most callers pass plain char*'s */
 int erts_unicode_list_to_buf(Eterm list, byte *buf, Sint len, Sint* written);
 Sint erts_unicode_list_to_buf_len(Eterm list);
 
-struct Sint_buf {
-#if defined(ARCH_64)
-    char s[22];
-#else
-    char s[12];
-#endif
-};	
-char* Sint_to_buf(Sint, struct Sint_buf*);
+int Sint_to_buf(Sint num, int base, char **buf_p, size_t buf_size);
 
 #define ERTS_IOLIST_STATE_INITER(C_P, OBJ)	\
     {(C_P), 0, 0, (OBJ), {NULL, NULL, NULL, ERTS_ALC_T_INVALID}, 0, 0}

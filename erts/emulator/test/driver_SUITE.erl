@@ -1069,14 +1069,19 @@ get_stable_check_io_info(N) ->
 get_check_io_total(ChkIo) ->
     ct:log("ChkIo = ~p~n",[ChkIo]),
     {Fallback, Rest} = get_fallback(ChkIo),
+    OnlyPollThreads = [PS || PS <- Rest, not is_scheduler_pollset(PS)],
     add_fallback_infos(Fallback,
-      lists:foldl(fun(Pollset, Acc) ->
-                          lists:zipwith(fun(A, B) ->
-                                                add_pollset_infos(A,B)
-                                        end,
-                                        Pollset, Acc)
-                  end,
-                  hd(Rest), tl(Rest))).
+      lists:foldl(
+        fun(Pollset, Acc) ->
+                lists:zipwith(fun(A, B) ->
+                                      add_pollset_infos(A,B)
+                              end,
+                              Pollset, Acc)
+        end,
+        hd(OnlyPollThreads), tl(OnlyPollThreads))).
+
+is_scheduler_pollset(Pollset) ->
+    proplists:get_value(poll_threads, Pollset) == 0.
 
 add_pollset_infos({Tag, A}=TA , {Tag, B}=TB) ->
     case tag_type(Tag) of
@@ -1754,7 +1759,7 @@ smp_select0(Config) ->
     ProcFun = fun()-> io:format("Worker ~p starting\n",[self()]),	
                       Port = open_port({spawn, DrvName}, []),
                       smp_select_loop(Port, 100000),
-                      sleep(1000), % wait for driver to handle pending events
+                      smp_select_done(Port),
                       true = erlang:port_close(Port),
                       Master ! {ok,self()},
                       io:format("Worker ~p finished\n",[self()])
@@ -1782,6 +1787,21 @@ smp_select_loop(Port, N) ->
             ok
     after 0 ->
               smp_select_loop(Port, N-1)
+    end.
+
+smp_select_done(Port) ->
+    case erlang:port_control(Port, ?CHKIO_SMP_SELECT, "done") of
+        "wait" ->
+            receive
+                {Port, done} ->
+                    ok
+            after 10*1000 ->
+                    %% Seems we have a lost ready_input event.
+                    %% Go ahead anyway, port will crash VM when closed.
+                    ok
+            end;
+
+        "ok" -> ok
     end.
 
 smp_select_wait([], _) ->
