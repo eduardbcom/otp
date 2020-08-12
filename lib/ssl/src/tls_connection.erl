@@ -396,10 +396,14 @@ handle_info({Protocol, _, Data}, StateName,
 	    ssl_connection:handle_normal_shutdown(Alert, StateName, State0), 
 	    {stop, {shutdown, own_alert}}
     end;
+handle_info({tcp_passive, Socket},  StateName, #state{socket = Socket, protocol_specific = PS} = State) ->
+    next_event(StateName, no_record, State#state{protocol_specific = PS#{active_n_toggle => true}});
 handle_info({CloseTag, Socket}, StateName,
             #state{socket = Socket, close_tag = CloseTag,
                    socket_options = #socket_options{active = Active},
                    protocol_buffers = #protocol_buffers{tls_cipher_texts = CTs},
+                   user_data_buffer = Buffer,
+                   protocol_specific = PS,
 		   negotiated_version = Version} = State) ->
 
     %% Note that as of TLS 1.1,
@@ -407,7 +411,7 @@ handle_info({CloseTag, Socket}, StateName,
     %% session not be resumed.  This is a change from TLS 1.0 to conform
     %% with widespread implementation practice.
 
-    case (Active == false) andalso (CTs =/= []) of
+    case (Active == false) andalso ((CTs =/= []) or (Buffer =/= <<>>)) of
         false ->
             case Version of
                 {1, N} when N >= 1 ->
@@ -425,8 +429,9 @@ handle_info({CloseTag, Socket}, StateName,
         true ->
             %% Fixes non-delivery of final TLS record in {active, once}.
             %% Basically allows the application the opportunity to set {active, once} again
-            %% and then receive the final message.
-            next_event(StateName, no_record, State)
+            %% and then receive the final message. Set internal active_n to zero
+            %% to ensure socket close message is sent if there is not enough data to deliver.
+            next_event(StateName, no_record, State#state{protocol_specific = PS#{active_n_toggle => true}})
     end;
 handle_info(Msg, StateName, State) ->
     ssl_connection:handle_info(Msg, StateName, State).
@@ -531,7 +536,7 @@ decode_alerts(Bin) ->
 
 initial_state(Role, Host, Port, Socket, {SSLOptions, SocketOptions, Tracker}, User,
 	      {CbModule, DataTag, CloseTag, ErrorTag}) ->
-    #ssl_options{beast_mitigation = BeastMitigation} = SSLOptions,
+    #ssl_options{beast_mitigation = BeastMitigation, erl_dist = IsErlDist} = SSLOptions,
     ConnectionStates = tls_record:init_connection_states(Role, BeastMitigation),
     
     SessionCacheCb = case application:get_env(ssl, session_cb) of
@@ -542,6 +547,14 @@ initial_state(Role, Host, Port, Socket, {SSLOptions, SocketOptions, Tracker}, Us
 		     end,
     
     Monitor = erlang:monitor(process, User),
+
+    DefaultInternalActiveN = 100,
+    InternalActiveN = case application:get_env(ssl, internal_active_n) of
+        {ok, N} when is_integer(N) andalso (not IsErlDist) ->
+            N;
+        _  ->
+            DefaultInternalActiveN
+    end,
 
     #state{socket_options = SocketOptions,
 	   ssl_options = SSLOptions,	   
@@ -564,7 +577,11 @@ initial_state(Role, Host, Port, Socket, {SSLOptions, SocketOptions, Tracker}, Us
 	   start_or_recv_from = undefined,
 	   protocol_cb = ?MODULE,
 	   tracker = Tracker,
-	   flight_buffer = []
+	   flight_buffer = [],
+       protocol_specific = #{
+           active_n => InternalActiveN,
+           active_n_toggle => true
+       }
 	  }.
 
 next_tls_record(Data, #state{protocol_buffers = #protocol_buffers{tls_record_buffer = Buf0,
@@ -595,10 +612,18 @@ next_record(#state{protocol_buffers =
 	    {Alert, State}
     end;
 next_record(#state{protocol_buffers = #protocol_buffers{tls_packets = [], tls_cipher_texts = []},
-		   socket = Socket,
-		   transport_cb = Transport} = State) ->
-    tls_socket:setopts(Transport, Socket, [{active,once}]),
-    {no_record, State};
+                   protocol_specific = #{active_n_toggle := true, active_n := N} = ProtocolSpec,
+                   socket = Socket,
+                   close_tag = CloseTag,
+		           transport_cb = Transport
+} = State) ->
+    case tls_socket:setopts(Transport, Socket, [{active, N}]) of
+        ok ->
+            {no_record, State#state{protocol_specific = ProtocolSpec#{active_n_toggle => false}}};
+        _ ->
+            self() ! {CloseTag, Socket},
+            {no_record, State}
+    end;
 next_record(State) ->
     {no_record, State}.
 
